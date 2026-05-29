@@ -356,28 +356,40 @@ custom_stage:
 
     def test_graph_path_uses_bm25_seed_when_vector_seed_misses_keyword_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config = self._config(tmpdir)
-            config.path_a_weight = 0.0
-            config.path_b_weight = 1.0
-            config.graph_seed_limit = 1
-            config.graph_bm25_seed_limit = 1
-            config.path_b_semantic_weight = 0.0
-            config.path_b_graph_weight = 0.0
-            config.path_b_bm25_weight = 1.0
-            system = MemorySystem(
-                config=config,
+            base_config = self._config(tmpdir)
+            base_config.path_a_weight = 0.0
+            base_config.path_b_weight = 1.0
+            base_config.graph_seed_limit = 0
+            base_config.path_b_semantic_weight = 0.0
+            base_config.path_b_graph_weight = 0.0
+            base_config.path_b_bm25_weight = 1.0
+            control_config = TCMemConfig(**base_config.to_dict(include_secrets=True))
+            control_config.graph_bm25_seed_limit = 0
+            enabled_config = TCMemConfig(**base_config.to_dict(include_secrets=True))
+            enabled_config.graph_bm25_seed_limit = 1
+
+            control_system = MemorySystem(
+                config=control_config,
                 embedding_client=KeywordRescueEmbeddingClient(),
                 llm_client=FakeLLMClient(),
             )
-            system.ingest_record(self._record("rec_alpha", "alpha question bridge note"))
-            system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail", entities=["alpha"]))
+            enabled_system = MemorySystem(
+                config=enabled_config,
+                embedding_client=KeywordRescueEmbeddingClient(),
+                llm_client=FakeLLMClient(),
+            )
+            for system in (control_system, enabled_system):
+                system.ingest_record(self._record("rec_alpha", "alpha question bridge note"))
+                system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail"))
 
-            result = system.retrieve("alpha question", top_k=5)
+            control_result = control_system.retrieve("alpha question", top_k=5)
+            enabled_result = enabled_system.retrieve("alpha question", top_k=5)
 
-        record_ids = [hit.source_record_id for hit in result.hits]
+        self.assertNotIn("rec_kw", [hit.source_record_id for hit in control_result.hits])
+        record_ids = [hit.source_record_id for hit in enabled_result.hits]
         self.assertIn("rec_kw", record_ids)
-        keyword_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_kw")
-        alpha_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_alpha")
+        keyword_hit = next(hit for hit in enabled_result.hits if hit.source_record_id == "rec_kw")
+        alpha_hit = next(hit for hit in enabled_result.hits if hit.source_record_id == "rec_alpha")
         self.assertIn("path_b_vector_bm25_graph", keyword_hit.reason)
         self.assertGreater(keyword_hit.bm25_score, 0.0)
         self.assertEqual(alpha_hit.bm25_score, 0.0)
