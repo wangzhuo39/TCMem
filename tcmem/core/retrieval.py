@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import math
-import re
 from dataclasses import dataclass, field
 
 from ..config import TCMemConfig
-from ..infrastructure.indices import BM25IndexHit, InMemoryBM25Index, VectorIndex, VectorIndexItem
+from ..infrastructure.indices import InMemoryBM25Index, VectorIndex, VectorIndexItem
 from ..models import ChainNodeStatus, RetrievalResult, SearchHit, TaskChainNode
 from ..utils.embedding_client import SemanticScorer
 from .graph_store import DialogueGraphStore
@@ -58,14 +56,7 @@ class RetrievalEngine:
             self._merge_record_hit(aggregates, hit)
 
         ranked = sorted(
-            (
-                hit
-                for candidate in aggregates.values()
-                if not (
-                    (hit := self._finalize_record_hit(candidate)).score <= 0.0
-                    and "path_b_vector_bm25_graph" not in hit.reason
-                )
-            ),
+            (self._finalize_record_hit(candidate) for candidate in aggregates.values()),
             key=lambda item: item.score,
             reverse=True,
         )[:top_k]
@@ -134,7 +125,7 @@ class RetrievalEngine:
     def _path_b(self, query: str, routed_task_ids: set[str]) -> list[SearchHit]:
         self.sync_record_index()
         vector_seeds = self.record_index.search(query, self.embedding_client, top_k=self.config.graph_seed_limit)
-        bm25_seeds = self._bm25_hits(query, top_k=self.config.graph_bm25_seed_limit)
+        bm25_seeds = self.bm25_index.search(query, top_k=self.config.graph_bm25_seed_limit)
         record_bm25_scores = self._record_bm25_scores(query)
         seeds = self._merge_path_b_seeds(vector_seeds, bm25_seeds)
         best_depth: dict[str, int] = {}
@@ -254,77 +245,8 @@ class RetrievalEngine:
             return {}
         return {
             hit.item_id: hit.score
-            for hit in self._bm25_hits(query, top_k=len(self.graph.records))
+            for hit in self.bm25_index.search(query, top_k=len(self.graph.records))
         }
-
-    def _bm25_hits(self, query: str, *, top_k: int) -> list[BM25IndexHit]:
-        hits = self.bm25_index.search(query, top_k=top_k)
-        if hits or top_k <= 0:
-            return hits
-
-        items = getattr(self.bm25_index, "_items", [])
-        tokenized_corpus = getattr(self.bm25_index, "_tokenized_corpus", [])
-        if not items or not tokenized_corpus:
-            return []
-
-        # The current BM25 wrapper can drop small-corpus hits for tiny corpora,
-        # including cases where matching terms score as all-zero. We recover a
-        # normalized lexical ranking from the indexed token corpus in that case.
-        query_tokens = re.findall(r"[a-z0-9]+", str(query or "").lower())
-        if not query_tokens:
-            return []
-
-        document_count = len(tokenized_corpus)
-        document_frequencies = {
-            token: sum(1 for tokens in tokenized_corpus if token in tokens)
-            for token in set(query_tokens)
-        }
-        lexical_pairs: list[tuple[int, float]] = []
-        for index, tokens in enumerate(tokenized_corpus):
-            if not tokens:
-                continue
-            score = 0.0
-            for token in query_tokens:
-                term_frequency = tokens.count(token)
-                if term_frequency <= 0:
-                    continue
-                document_frequency = document_frequencies.get(token, 0)
-                inverse_document_frequency = math.log((document_count + 1.0) / (document_frequency + 1.0))
-                score += term_frequency * max(inverse_document_frequency, 0.0)
-            if score > 0.0:
-                lexical_pairs.append((index, score))
-        if not lexical_pairs:
-            return []
-
-        normalized_scores = self._normalize_scores([score for _index, score in lexical_pairs])
-        ranked_pairs = sorted(
-            zip(lexical_pairs, normalized_scores, strict=False),
-            key=lambda item: item[1],
-            reverse=True,
-        )[: min(top_k, len(lexical_pairs))]
-        fallback_hits: list[BM25IndexHit] = []
-        for (item_index, _raw_score), normalized_score in ranked_pairs:
-            item = items[item_index]
-            fallback_hits.append(
-                BM25IndexHit(
-                    item_id=item.item_id,
-                    score=round(normalized_score, 6),
-                    text=item.text,
-                    metadata=dict(item.metadata),
-                )
-            )
-        return fallback_hits
-
-    def _normalize_scores(self, scores: list[float]) -> list[float]:
-        if not scores:
-            return []
-        minimum = min(scores)
-        maximum = max(scores)
-        if maximum <= minimum:
-            if maximum == 0.0:
-                return [0.0 for _score in scores]
-            return [1.0 for _score in scores]
-        return [(score - minimum) / (maximum - minimum) for score in scores]
 
     def _best_chain_context(self, record_id: str, routed_task_ids: set[str]) -> dict[str, float | str] | None:
         best: dict[str, float | str] | None = None

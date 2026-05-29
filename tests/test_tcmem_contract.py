@@ -97,6 +97,14 @@ class FakeLLMClient:
         raise AssertionError(f"Unexpected prompt: {prompt}")
 
 
+class NoRouteLLMClient(FakeLLMClient):
+    def generate(self, prompt: str, **_kwargs) -> str:
+        payload = _prompt_payload(prompt)
+        if "query" in payload:
+            return json.dumps({"routed_task_ids": [], "reason": "none"})
+        return super().generate(prompt, **_kwargs)
+
+
 class FlakyJSONLLMClient:
     json_max_attempts = 5
     json_retry_delay = 0.0
@@ -423,16 +431,17 @@ custom_stage:
             control_system = MemorySystem(
                 config=control_config,
                 embedding_client=KeywordRescueEmbeddingClient(),
-                llm_client=FakeLLMClient(),
+                llm_client=NoRouteLLMClient(),
             )
             enabled_system = MemorySystem(
                 config=enabled_config,
                 embedding_client=KeywordRescueEmbeddingClient(),
-                llm_client=FakeLLMClient(),
+                llm_client=NoRouteLLMClient(),
             )
             for system in (control_system, enabled_system):
                 system.ingest_record(self._record("rec_alpha", "alpha question bridge note", entities=["shared"]))
                 system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail", entities=["shared"]))
+                system.ingest_record(self._record("rec_none", "beta generic note"))
 
             control_result = control_system.retrieve("zanzibar ledger", top_k=5)
             enabled_result = enabled_system.retrieve("zanzibar ledger", top_k=5)
@@ -459,10 +468,11 @@ custom_stage:
             system = MemorySystem(
                 config=config,
                 embedding_client=FakeEmbeddingClient(),
-                llm_client=FakeLLMClient(),
+                llm_client=NoRouteLLMClient(),
             )
             system.ingest_record(self._record("rec_low", "zanzibar archive"))
             system.ingest_record(self._record("rec_high", "ledger ledger zanzibar ledger archive"))
+            system.ingest_record(self._record("rec_none", "alpha generic project note"))
 
             result = system.retrieve("zanzibar ledger", top_k=2)
 
