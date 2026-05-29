@@ -361,6 +361,20 @@ custom_stage:
         self.assertTrue(all(0.0 <= hit.score <= 1.0 for hit in hits))
         self.assertLess(hits[1].score, 1.0)
 
+        index.sync_items(
+            [
+                VectorIndexItem("rec_empty", "!!!"),
+                VectorIndexItem("rec_mixed", "ledger ledger zanzibar ledger archive"),
+                VectorIndexItem("rec_none", "alpha generic project note"),
+            ]
+        )
+
+        mixed_hits = index.search("zanzibar ledger", top_k=3)
+
+        self.assertEqual([hit.item_id for hit in mixed_hits], ["rec_mixed"])
+        self.assertEqual(mixed_hits[0].score, 1.0)
+        self.assertTrue(all(0.0 <= hit.score <= 1.0 for hit in mixed_hits))
+
     def test_memory_system_retrieves_through_persistent_vector_index_and_task_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             system = MemorySystem(
