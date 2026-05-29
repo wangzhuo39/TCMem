@@ -300,10 +300,18 @@ custom_stage:
 
     def test_search_hit_and_config_support_bm25_path_b_scoring(self) -> None:
         config = TCMemConfig(path_b_bm25_weight=0.25)
+        clamped_config = TCMemConfig(path_b_bm25_weight=-1)
         hit = SearchHit(item_id="rec", item_kind="dialogue_record", score=1.0)
+        positional_hit = SearchHit("rec", "dialogue_record", 1.0, 0.9, 0.8, 0.7, 0.6)
 
         self.assertEqual(config.path_b_bm25_weight, 0.25)
+        self.assertEqual(clamped_config.path_b_bm25_weight, 0.0)
         self.assertEqual(hit.bm25_score, 0.0)
+        self.assertEqual(positional_hit.semantic_score, 0.9)
+        self.assertEqual(positional_hit.chain_score, 0.8)
+        self.assertEqual(positional_hit.graph_score, 0.7)
+        self.assertEqual(positional_hit.route_score, 0.6)
+        self.assertEqual(positional_hit.bm25_score, 0.0)
 
     def _config(self, tmpdir: str) -> TCMemConfig:
         return TCMemConfig(

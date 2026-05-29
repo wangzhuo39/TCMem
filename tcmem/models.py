@@ -132,7 +132,6 @@ class SearchHit:
     item_kind: str
     score: float
     semantic_score: float = 0.0
-    bm25_score: float = 0.0
     chain_score: float = 0.0
     graph_score: float = 0.0
     route_score: float = 0.0
@@ -141,6 +140,7 @@ class SearchHit:
     task_id: str | None = None
     source_record_id: str | None = None
     chain_node_id: str | None = None
+    bm25_score: float = 0.0
 
 
 @dataclass(slots=True)
