@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 
 from ..config import TCMemConfig
-from ..infrastructure.indices import VectorIndex, VectorIndexItem
+from ..infrastructure.indices import BM25IndexHit, InMemoryBM25Index, VectorIndex, VectorIndexItem
 from ..models import ChainNodeStatus, RetrievalResult, SearchHit, TaskChainNode
 from ..utils.embedding_client import SemanticScorer
 from .graph_store import DialogueGraphStore
@@ -14,6 +16,7 @@ from .task_chain import TaskChainManager
 class _RecordAggregate:
     record_id: str
     semantic_score: float = 0.0
+    bm25_score: float = 0.0
     chain_score: float = 0.0
     graph_score: float = 0.0
     route_score: float = 0.0
@@ -35,12 +38,14 @@ class RetrievalEngine:
         task_manager: TaskChainManager,
         embedding_client: SemanticScorer,
         record_index: VectorIndex,
+        bm25_index: InMemoryBM25Index | None = None,
     ) -> None:
         self.config = config
         self.graph = graph
         self.task_manager = task_manager
         self.embedding_client = embedding_client
         self.record_index = record_index
+        self.bm25_index = bm25_index or InMemoryBM25Index()
 
     def retrieve(self, query: str, *, top_k: int = 10) -> RetrievalResult:
         routed_task_ids = self.task_manager.route_for_query(query)
@@ -53,30 +58,45 @@ class RetrievalEngine:
             self._merge_record_hit(aggregates, hit)
 
         ranked = sorted(
-            (self._finalize_record_hit(candidate) for candidate in aggregates.values()),
+            (
+                hit
+                for candidate in aggregates.values()
+                if not (
+                    (hit := self._finalize_record_hit(candidate)).score <= 0.0
+                    and "path_b_vector_bm25_graph" not in hit.reason
+                )
+            ),
             key=lambda item: item.score,
             reverse=True,
         )[:top_k]
-        return RetrievalResult(query=query, subqueries=[query], routed_task_ids=routed_task_ids, hits=ranked, explanation="task_chain_plus_graph_vector")
+        return RetrievalResult(
+            query=query,
+            subqueries=[query],
+            routed_task_ids=routed_task_ids,
+            hits=ranked,
+            explanation="task_chain_plus_graph_vector_bm25",
+        )
 
     def sync_record_index(self) -> None:
+        items = [
+            VectorIndexItem(
+                item_id=record.record_id,
+                text=record.combined_content,
+                metadata={
+                    "session_identifier": record.session_identifier,
+                    "session_uuid": record.session_uuid,
+                    "record_time": record.record_time,
+                },
+            )
+            for record in self.graph.records.values()
+        ]
         self.record_index.sync_items(
-            [
-                VectorIndexItem(
-                    item_id=record.record_id,
-                    text=record.combined_content,
-                    metadata={
-                        "session_identifier": record.session_identifier,
-                        "session_uuid": record.session_uuid,
-                        "record_time": record.record_time,
-                    },
-                )
-                for record in self.graph.records.values()
-            ],
+            items,
             self.embedding_client,
             embedding_signature=self.config.embedding_signature(),
             rebuild=self.config.vector_index_rebuild,
         )
+        self.bm25_index.sync_items(items)
 
     def _path_a(self, query: str, routed_task_ids: list[str]) -> list[SearchHit]:
         hits: list[SearchHit] = []
@@ -113,17 +133,18 @@ class RetrievalEngine:
 
     def _path_b(self, query: str, routed_task_ids: set[str]) -> list[SearchHit]:
         self.sync_record_index()
-        seeds = self.record_index.search(query, self.embedding_client, top_k=self.config.graph_seed_limit)
+        vector_seeds = self.record_index.search(query, self.embedding_client, top_k=self.config.graph_seed_limit)
+        bm25_seeds = self._bm25_hits(query, top_k=self.config.graph_bm25_seed_limit)
+        record_bm25_scores = self._record_bm25_scores(query)
+        seeds = self._merge_path_b_seeds(vector_seeds, bm25_seeds)
         best_depth: dict[str, int] = {}
         best_graph_score: dict[str, float] = {}
-        best_seed_score: dict[str, float] = {}
         for seed in seeds:
             walk = self.graph.walk([seed.item_id], max_depth=self.config.graph_walk_depth)
             for record_id, depth in walk.items():
                 graph_score = seed.score / (depth + 1)
                 if record_id not in best_graph_score or graph_score > best_graph_score[record_id]:
                     best_graph_score[record_id] = graph_score
-                    best_seed_score[record_id] = seed.score
                     best_depth[record_id] = depth
 
         hits: list[SearchHit] = []
@@ -131,10 +152,13 @@ class RetrievalEngine:
             record = self.graph.get_record(record_id)
             if record is None:
                 continue
-            semantic_score = best_seed_score.get(record_id)
-            if semantic_score is None:
-                semantic_score = self.embedding_client.score(query, record.combined_content)
-            base_score = self.config.path_b_semantic_weight * semantic_score + self.config.path_b_graph_weight * graph_score
+            semantic_score = self.embedding_client.score(query, record.combined_content)
+            bm25_score = record_bm25_scores.get(record_id, 0.0)
+            base_score = (
+                self.config.path_b_semantic_weight * semantic_score
+                + self.config.path_b_bm25_weight * bm25_score
+                + self.config.path_b_graph_weight * graph_score
+            )
             context = self._best_chain_context(record_id, routed_task_ids)
             penalty = float(context["penalty"]) if context is not None else 1.0
             hits.append(
@@ -143,11 +167,12 @@ class RetrievalEngine:
                     item_kind="dialogue_record",
                     score=base_score * penalty,
                     semantic_score=semantic_score,
+                    bm25_score=bm25_score,
                     graph_score=graph_score,
                     chain_score=float(context["chain_score"]) if context is not None else 0.0,
                     route_score=float(context["route_score"]) if context is not None else 0.0,
                     depth=best_depth.get(record_id, 0),
-                    reason="path_b_vector_graph",
+                    reason="path_b_vector_bm25_graph",
                     task_id=str(context["task_id"]) if context is not None and context.get("task_id") else None,
                     source_record_id=record_id,
                     chain_node_id=str(context["node_id"]) if context is not None and context.get("node_id") else None,
@@ -162,12 +187,13 @@ class RetrievalEngine:
             aggregate = _RecordAggregate(record_id=record_id)
             aggregates[record_id] = aggregate
         aggregate.semantic_score = max(aggregate.semantic_score, hit.semantic_score)
+        aggregate.bm25_score = max(aggregate.bm25_score, hit.bm25_score)
         aggregate.chain_score = max(aggregate.chain_score, hit.chain_score)
         aggregate.graph_score = max(aggregate.graph_score, hit.graph_score)
         aggregate.route_score = max(aggregate.route_score, hit.route_score)
         if hit.reason == "path_a_chain":
             aggregate.path_a_score = max(aggregate.path_a_score, hit.score)
-        elif hit.reason == "path_b_vector_graph":
+        elif hit.reason == "path_b_vector_bm25_graph":
             aggregate.path_b_score = max(aggregate.path_b_score, hit.score)
         if hit.reason and hit.reason not in aggregate.reasons:
             aggregate.reasons.append(hit.reason)
@@ -179,13 +205,14 @@ class RetrievalEngine:
 
     def _finalize_record_hit(self, aggregate: _RecordAggregate) -> SearchHit:
         score = self.config.path_a_weight * aggregate.path_a_score + self.config.path_b_weight * aggregate.path_b_score
-        ordered_reasons = [reason for reason in ("path_a_chain", "path_b_vector_graph") if reason in aggregate.reasons]
+        ordered_reasons = [reason for reason in ("path_a_chain", "path_b_vector_bm25_graph") if reason in aggregate.reasons]
         ordered_reasons.extend(reason for reason in aggregate.reasons if reason not in ordered_reasons)
         return SearchHit(
             item_id=aggregate.record_id,
             item_kind="dialogue_record",
             score=score,
             semantic_score=aggregate.semantic_score,
+            bm25_score=aggregate.bm25_score,
             chain_score=aggregate.chain_score,
             graph_score=aggregate.graph_score,
             route_score=aggregate.route_score,
@@ -195,6 +222,109 @@ class RetrievalEngine:
             source_record_id=aggregate.record_id,
             chain_node_id=aggregate.chain_node_id,
         )
+
+    def _merge_path_b_seeds(self, vector_seeds: list, bm25_seeds: list) -> list[SearchHit]:
+        merged: dict[str, dict[str, float]] = {}
+        for seed in vector_seeds:
+            merged.setdefault(seed.item_id, {})["semantic_score"] = seed.score
+        for seed in bm25_seeds:
+            merged.setdefault(seed.item_id, {})["bm25_score"] = seed.score
+
+        hits: list[SearchHit] = []
+        for record_id, scores in merged.items():
+            semantic_score = float(scores.get("semantic_score", 0.0))
+            bm25_score = float(scores.get("bm25_score", 0.0))
+            hits.append(
+                SearchHit(
+                    item_id=record_id,
+                    item_kind="dialogue_record",
+                    score=(
+                        self.config.graph_vector_seed_weight * semantic_score
+                        + self.config.graph_bm25_seed_weight * bm25_score
+                    ),
+                    semantic_score=semantic_score,
+                    bm25_score=bm25_score,
+                    source_record_id=record_id,
+                )
+            )
+        return hits
+
+    def _record_bm25_scores(self, query: str) -> dict[str, float]:
+        if not self.graph.records:
+            return {}
+        return {
+            hit.item_id: hit.score
+            for hit in self._bm25_hits(query, top_k=len(self.graph.records))
+        }
+
+    def _bm25_hits(self, query: str, *, top_k: int) -> list[BM25IndexHit]:
+        hits = self.bm25_index.search(query, top_k=top_k)
+        if hits or top_k <= 0:
+            return hits
+
+        items = getattr(self.bm25_index, "_items", [])
+        tokenized_corpus = getattr(self.bm25_index, "_tokenized_corpus", [])
+        if not items or not tokenized_corpus:
+            return []
+
+        # The current BM25 wrapper can drop small-corpus hits for tiny corpora,
+        # including cases where matching terms score as all-zero. We recover a
+        # normalized lexical ranking from the indexed token corpus in that case.
+        query_tokens = re.findall(r"[a-z0-9]+", str(query or "").lower())
+        if not query_tokens:
+            return []
+
+        document_count = len(tokenized_corpus)
+        document_frequencies = {
+            token: sum(1 for tokens in tokenized_corpus if token in tokens)
+            for token in set(query_tokens)
+        }
+        lexical_pairs: list[tuple[int, float]] = []
+        for index, tokens in enumerate(tokenized_corpus):
+            if not tokens:
+                continue
+            score = 0.0
+            for token in query_tokens:
+                term_frequency = tokens.count(token)
+                if term_frequency <= 0:
+                    continue
+                document_frequency = document_frequencies.get(token, 0)
+                inverse_document_frequency = math.log((document_count + 1.0) / (document_frequency + 1.0))
+                score += term_frequency * max(inverse_document_frequency, 0.0)
+            if score > 0.0:
+                lexical_pairs.append((index, score))
+        if not lexical_pairs:
+            return []
+
+        normalized_scores = self._normalize_scores([score for _index, score in lexical_pairs])
+        ranked_pairs = sorted(
+            zip(lexical_pairs, normalized_scores, strict=False),
+            key=lambda item: item[1],
+            reverse=True,
+        )[: min(top_k, len(lexical_pairs))]
+        fallback_hits: list[BM25IndexHit] = []
+        for (item_index, _raw_score), normalized_score in ranked_pairs:
+            item = items[item_index]
+            fallback_hits.append(
+                BM25IndexHit(
+                    item_id=item.item_id,
+                    score=round(normalized_score, 6),
+                    text=item.text,
+                    metadata=dict(item.metadata),
+                )
+            )
+        return fallback_hits
+
+    def _normalize_scores(self, scores: list[float]) -> list[float]:
+        if not scores:
+            return []
+        minimum = min(scores)
+        maximum = max(scores)
+        if maximum <= minimum:
+            if maximum == 0.0:
+                return [0.0 for _score in scores]
+            return [1.0 for _score in scores]
+        return [(score - minimum) / (maximum - minimum) for score in scores]
 
     def _best_chain_context(self, record_id: str, routed_task_ids: set[str]) -> dict[str, float | str] | None:
         best: dict[str, float | str] | None = None

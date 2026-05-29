@@ -431,11 +431,11 @@ custom_stage:
                 llm_client=FakeLLMClient(),
             )
             for system in (control_system, enabled_system):
-                system.ingest_record(self._record("rec_alpha", "alpha question bridge note"))
-                system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail"))
+                system.ingest_record(self._record("rec_alpha", "alpha question bridge note", entities=["shared"]))
+                system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail", entities=["shared"]))
 
-            control_result = control_system.retrieve("alpha question", top_k=5)
-            enabled_result = enabled_system.retrieve("alpha question", top_k=5)
+            control_result = control_system.retrieve("zanzibar ledger", top_k=5)
+            enabled_result = enabled_system.retrieve("zanzibar ledger", top_k=5)
 
         self.assertNotIn("rec_kw", [hit.source_record_id for hit in control_result.hits])
         record_ids = [hit.source_record_id for hit in enabled_result.hits]
