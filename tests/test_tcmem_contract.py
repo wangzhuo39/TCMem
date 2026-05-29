@@ -354,8 +354,9 @@ custom_stage:
 
         self.assertEqual([hit.item_id for hit in hits[:2]], ["rec_high", "rec_low"])
         self.assertGreater(hits[0].score, hits[1].score)
-        self.assertLessEqual(hits[0].score, 1.0)
-        self.assertGreaterEqual(hits[1].score, 0.0)
+        self.assertEqual(hits[0].score, 1.0)
+        self.assertTrue(all(0.0 <= hit.score <= 1.0 for hit in hits))
+        self.assertLess(hits[1].score, 1.0)
 
     def test_memory_system_retrieves_through_persistent_vector_index_and_task_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

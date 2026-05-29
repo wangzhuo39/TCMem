@@ -9,50 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    class BM25Okapi:  # pragma: no cover - exercised indirectly in environments without rank_bm25.
-        def __init__(self, corpus: list[list[str]], *, k1: float = 1.5, b: float = 0.75) -> None:
-            self.corpus = corpus
-            self.k1 = k1
-            self.b = b
-            self.doc_count = len(corpus)
-            self.doc_lengths = np.asarray([len(document) for document in corpus], dtype="float32")
-            self.average_doc_length = float(np.mean(self.doc_lengths)) if self.doc_count else 0.0
-            self.term_frequencies: list[dict[str, int]] = []
-            document_frequency: dict[str, int] = {}
-            for document in corpus:
-                frequencies: dict[str, int] = {}
-                for token in document:
-                    frequencies[token] = frequencies.get(token, 0) + 1
-                self.term_frequencies.append(frequencies)
-                for token in frequencies:
-                    document_frequency[token] = document_frequency.get(token, 0) + 1
-            self.idf = {
-                token: float(np.log(1.0 + (self.doc_count - freq + 0.5) / (freq + 0.5)))
-                for token, freq in document_frequency.items()
-            }
-
-        def get_scores(self, query_tokens: list[str]) -> np.ndarray:
-            if self.doc_count == 0:
-                return np.zeros((0,), dtype="float32")
-            scores = np.zeros((self.doc_count,), dtype="float32")
-            if not query_tokens:
-                return scores
-            for index, frequencies in enumerate(self.term_frequencies):
-                doc_length = float(self.doc_lengths[index]) if index < len(self.doc_lengths) else 0.0
-                norm = self.k1 * (1.0 - self.b + self.b * doc_length / self.average_doc_length) if self.average_doc_length > 0.0 else self.k1
-                score = 0.0
-                for token in query_tokens:
-                    frequency = frequencies.get(token, 0)
-                    if frequency <= 0:
-                        continue
-                    numerator = frequency * (self.k1 + 1.0)
-                    denominator = frequency + norm
-                    score += self.idf.get(token, 0.0) * numerator / denominator if denominator > 0.0 else 0.0
-                scores[index] = score
-            return scores
+from rank_bm25 import BM25Okapi
 
 from ..config import TCMemConfig
 from ..utils.embedding_client import SemanticScorer
