@@ -132,6 +132,7 @@ class SearchHit:
     item_kind: str
     score: float
     semantic_score: float = 0.0
+    bm25_score: float = 0.0
     chain_score: float = 0.0
     graph_score: float = 0.0
     route_score: float = 0.0

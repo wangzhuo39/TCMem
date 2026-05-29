@@ -30,13 +30,18 @@ class TCMemConfig:
     path_a_status_weight: float = 0.2
     path_a_chain_weight: float = 0.1
     path_b_semantic_weight: float = 0.45
+    path_b_bm25_weight: float = 0.2
     path_b_graph_weight: float = 0.55
     graph_seed_limit: int = 12
+    graph_bm25_seed_limit: int = 12
+    graph_vector_seed_weight: float = 0.7
+    graph_bm25_seed_weight: float = 0.3
     graph_walk_depth: int = 2
     routed_task_score: float = 1.0
     unrouted_task_score: float = 0.3
     task_metadata_refresh_interval: int = 5
     task_router_entity_limit: int = 20
+    query_router_candidate_count: int = 5
     prompt_path: str = ""
 
     active_status_score: float = 1.0
@@ -65,6 +70,11 @@ class TCMemConfig:
             raise ValueError("vector_index_backend must be one of: chroma, numpy, faiss")
         if self.embedding_backend != "sentence_transformers":
             raise ValueError("Only sentence_transformers embedding backend is currently implemented")
+        self.query_router_candidate_count = min(8, max(3, int(self.query_router_candidate_count or 5)))
+        self.path_b_bm25_weight = max(0.0, float(self.path_b_bm25_weight or 0.0))
+        self.graph_seed_limit = max(0, int(self.graph_seed_limit or 0))
+        self.graph_bm25_seed_limit = max(0, int(self.graph_bm25_seed_limit or 0))
+        self.graph_walk_depth = max(0, int(self.graph_walk_depth or 0))
 
     @property
     def state_path(self) -> Path:

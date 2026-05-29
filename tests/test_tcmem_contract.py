@@ -6,7 +6,7 @@ import re
 
 import numpy as np
 
-from tcmem import DialogueRecord, TCMemConfig
+from tcmem import DialogueRecord, SearchHit, TCMemConfig
 from tcmem.core.graph_store import DialogueGraphStore
 from tcmem.core.memory_system import MemorySystem
 from tcmem.core.task_chain import TaskChainManager, _extract_json_payload
@@ -297,6 +297,13 @@ custom_stage:
 
         self.assertEqual(config.to_dict()["llm_api_key"], "")
         self.assertEqual(config.to_dict(include_secrets=True)["llm_api_key"], "secret")
+
+    def test_search_hit_and_config_support_bm25_path_b_scoring(self) -> None:
+        config = TCMemConfig(path_b_bm25_weight=0.25)
+        hit = SearchHit(item_id="rec", item_kind="dialogue_record", score=1.0)
+
+        self.assertEqual(config.path_b_bm25_weight, 0.25)
+        self.assertEqual(hit.bm25_score, 0.0)
 
     def _config(self, tmpdir: str) -> TCMemConfig:
         return TCMemConfig(
