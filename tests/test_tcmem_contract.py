@@ -198,11 +198,29 @@ class TCMemContractTest(unittest.TestCase):
             "task_metadata_refresh",
         ]:
             rendered = registry.render(name, payload_json='{"ok": true}')
-            self.assertEqual(rendered.system_prompt, "")
+            self.assertTrue(rendered.system_prompt)
             self.assertIn("{{payload_json}}", Path(f"tcmem/prompts/{name}.txt").read_text(encoding="utf-8"))
             self.assertIn('{"ok": true}', rendered.user_prompt)
             self.assertIn("## Input", rendered.user_prompt)
             self.assertIn("## Output format", rendered.user_prompt)
+
+    def test_split_txt_prompt_loads_system_and_user_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_dir = Path(tmpdir)
+            (prompt_dir / "query_routing.txt").write_text(
+                """
+--- system ---
+Custom query router system.
+--- user ---
+payload={{payload_json}}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            rendered = PromptRegistry.from_path(prompt_dir).render("query_routing", payload_json='{"query": "alpha"}')
+
+        self.assertEqual(rendered.system_prompt, "Custom query router system.")
+        self.assertEqual(rendered.user_prompt, 'payload={"query": "alpha"}')
 
     def test_realmem_default_prompts_match_realmembench_eval_style(self) -> None:
         registry = PromptRegistry.default()
@@ -323,8 +341,80 @@ custom_stage:
             result = system.retrieve("alpha question", top_k=1)
 
         self.assertEqual(result.hits[0].source_record_id, "rec_alpha")
-        self.assertIn("path_b_vector_graph", result.hits[0].reason)
+        self.assertIn("path_b_vector_bm25_graph", result.hits[0].reason)
         self.assertTrue(result.routed_task_ids)
+
+    def test_graph_path_uses_bm25_seed_when_vector_seed_misses_keyword_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            config.path_a_weight = 0.0
+            config.path_b_weight = 1.0
+            config.graph_seed_limit = 1
+            config.graph_bm25_seed_limit = 1
+            config.path_b_semantic_weight = 0.0
+            config.path_b_graph_weight = 0.0
+            config.path_b_bm25_weight = 1.0
+            system = MemorySystem(
+                config=config,
+                embedding_client=FakeEmbeddingClient(),
+                llm_client=FakeLLMClient(),
+            )
+            system.ingest_record(self._record("rec_alpha", "alpha generic project note"))
+            system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail"))
+
+            result = system.retrieve("zanzibar ledger", top_k=5)
+
+        record_ids = [hit.source_record_id for hit in result.hits]
+        self.assertIn("rec_kw", record_ids)
+        keyword_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_kw")
+        self.assertIn("path_b_vector_bm25_graph", keyword_hit.reason)
+        self.assertGreater(keyword_hit.bm25_score, 0.0)
+
+    def test_path_b_ranking_uses_explicit_bm25_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            config.path_a_weight = 0.0
+            config.path_b_weight = 1.0
+            config.graph_seed_limit = 0
+            config.graph_bm25_seed_limit = 2
+            config.path_b_semantic_weight = 0.0
+            config.path_b_graph_weight = 0.0
+            config.path_b_bm25_weight = 1.0
+            system = MemorySystem(
+                config=config,
+                embedding_client=FakeEmbeddingClient(),
+                llm_client=FakeLLMClient(),
+            )
+            system.ingest_record(self._record("rec_high", "ledger ledger zanzibar ledger archive"))
+            system.ingest_record(self._record("rec_low", "zanzibar archive"))
+
+            result = system.retrieve("zanzibar ledger", top_k=2)
+
+        self.assertEqual([hit.source_record_id for hit in result.hits], ["rec_high", "rec_low"])
+        self.assertGreater(result.hits[0].bm25_score, result.hits[1].bm25_score)
+
+    def test_path_b_graph_neighbor_without_lexical_match_keeps_zero_bm25_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._config(tmpdir)
+            config.path_a_weight = 0.0
+            config.path_b_weight = 1.0
+            config.graph_seed_limit = 0
+            config.graph_bm25_seed_limit = 1
+            config.path_b_semantic_weight = 0.0
+            config.path_b_graph_weight = 1.0
+            config.path_b_bm25_weight = 0.0
+            system = MemorySystem(
+                config=config,
+                embedding_client=FakeEmbeddingClient(),
+                llm_client=FakeLLMClient(),
+            )
+            system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail", entities=["shared"]))
+            system.ingest_record(self._record("rec_neighbor", "alpha planning note", entities=["shared"]))
+
+            result = system.retrieve("zanzibar ledger", top_k=5)
+
+        neighbor_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_neighbor")
+        self.assertEqual(neighbor_hit.bm25_score, 0.0)
 
     def test_query_routing_requires_llm_client_without_fallback(self) -> None:
         manager = TaskChainManager("unit", llm_client=None)
@@ -425,6 +515,27 @@ custom_stage:
         task_summary = llm.payloads[-1]["task_catalog"][0]
         self.assertEqual(set(task_summary), {"task_id", "task_description", "entities"})
         self.assertEqual(task_summary["entities"], [f"e{i}" for i in range(20)])
+
+    def test_query_routing_sends_candidate_count_and_limits_returned_ids(self) -> None:
+        llm = CapturingLLMClient(
+            {
+                "routed_task_ids": [f"task_{index}" for index in range(10)],
+                "reason": "ranked candidates",
+            }
+        )
+        manager = TaskChainManager("unit", llm_client=llm, query_router_candidate_count=3)
+        for index in range(10):
+            task = manager.create_task_from_record(
+                self._record(f"rec_{index}", f"topic {index}"),
+                {"task_description": f"Topic {index} task"},
+            )
+            task.task_id = f"task_{index}"
+            manager.tasks[task.task_id] = task
+
+        routed = manager.route_for_query("topic question")
+
+        self.assertEqual(llm.payloads[-1]["candidate_count"], 3)
+        self.assertEqual(routed, ["task_0", "task_1", "task_2"])
 
     def test_record_router_payload_omits_stable_session_and_metadata_fields(self) -> None:
         llm = CapturingLLMClient(
