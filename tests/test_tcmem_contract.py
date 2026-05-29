@@ -10,6 +10,7 @@ from tcmem.core.graph_store import DialogueGraphStore
 from tcmem.core.memory_system import MemorySystem
 from tcmem.core.task_chain import TaskChainManager
 from tcmem.infrastructure.indices import NumpyVectorIndex, VectorIndexItem
+from tcmem.logging_utils import ModuleLogStore
 
 
 class FakeEmbeddingClient:
@@ -80,6 +81,20 @@ class FakeLLMClient:
             ]
             return json.dumps({"routed_task_ids": routed or [task["task_id"] for task in tasks[:1]], "reason": "matched"})
         raise AssertionError(f"Unexpected prompt: {prompt}")
+
+
+class FlakyJSONLLMClient:
+    json_max_attempts = 3
+    json_retry_delay = 0.0
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, prompt: str, **_kwargs) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            return '{"routed_task_ids": ["task_manual"], "reason": "'
+        return json.dumps({"routed_task_ids": ["task_manual"], "reason": "ok"})
 
 
 class TCMemContractTest(unittest.TestCase):
@@ -153,6 +168,27 @@ class TCMemContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "LLM client missing for stage query_routing"):
             manager.route_for_query("alpha question")
+
+    def test_query_routing_retries_json_decode_error_and_logs_raw_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            llm = FlakyJSONLLMClient()
+            manager = TaskChainManager("unit", llm_client=llm, log_store=log_store)
+            record = self._record("rec_alpha", "alpha project decision", entities=["alpha"])
+            task = manager.create_task_from_record(record, {"task_description": "Alpha task", "topic": "Alpha"})
+            task.task_id = "task_manual"
+            manager.tasks = {"task_manual": task}
+
+            routed = manager.route_for_query("alpha question")
+
+            errors = (Path(tmpdir) / "run" / "llm_errors.jsonl").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(routed, ["task_manual"])
+        self.assertEqual(llm.calls, 2)
+        payload = json.loads(errors[0])["payload"]
+        self.assertEqual(payload["stage"], "query_routing")
+        self.assertEqual(payload["attempt"], 1)
+        self.assertIn("raw_response_excerpt", payload)
 
     def test_state_round_trip_preserves_graph_and_task_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -220,6 +220,18 @@ def build_progress_payload(
     return payload
 
 
+def log_query_result(log_store: ModuleLogStore, event: str, result: dict[str, Any]) -> None:
+    log_store.log("query_results", event, **result)
+
+
+def save_latest_state(system: MemorySystem, output_dir: Path) -> Path:
+    return system.save(output_dir / "memory_state_latest.json")
+
+
+def should_save_record_state(processed_records: int, every_records: int) -> bool:
+    return every_records > 0 and processed_records > 0 and processed_records % every_records == 0
+
+
 def build_session_text_by_uuid(dataset: dict[str, Any]) -> dict[str, str]:
     session_text_by_uuid: dict[str, str] = {}
     for dialogue in dataset.get("dialogues", []) or []:
@@ -602,6 +614,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     generation_results[example.query_id] = result["generation_result"]
                 evaluated += 1
                 summary_so_far = summarize_metrics(detailed_results, session_ks)
+                log_query_result(log_store, "query_completed", result)
                 log_store.log("metrics", "cumulative_metrics", query_id=example.query_id, **summary_so_far)
                 log_store.log(
                     "progress",
@@ -616,6 +629,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                         query_id=example.query_id,
                     ),
                 )
+                save_latest_state(system, output_dir)
                 if args.verbose:
                     elapsed = time.time() - started_at
                     print(f"[query] {evaluated}/{len(examples)} {example.query_id} recall_all@{max(session_ks)}={result['retrieval_metrics'][f'recall_all@{max(session_ks)}']:.1f} elapsed={elapsed:.1f}s", flush=True)
@@ -637,23 +651,26 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     error_type=type(exc).__name__,
                     message=str(exc),
                 )
-                detailed_results.append(
-                    {
-                        "query_id": example.query_id,
-                        "question": example.question,
-                        "gold_session_uuids": example.gold_session_uuids,
-                        "retrieved_session_uuids": [],
-                        "ranked_session_uuids": [],
-                        "ranked_sessions": [],
-                        "retrieval_metrics": compute_retrieval_metrics(
-                            retrieved_session_uuids=[],
-                            gold_session_uuids=example.gold_session_uuids,
-                            ks=session_ks,
-                        ),
-                        "qa_score": None,
-                        "qa_reason": str(exc),
-                    }
-                )
+                failure_result = {
+                    "query_id": example.query_id,
+                    "question": example.question,
+                    "gold_session_uuids": example.gold_session_uuids,
+                    "retrieved_session_uuids": [],
+                    "ranked_session_uuids": [],
+                    "ranked_sessions": [],
+                    "retrieval_metrics": compute_retrieval_metrics(
+                        retrieved_session_uuids=[],
+                        gold_session_uuids=example.gold_session_uuids,
+                        ks=session_ks,
+                    ),
+                    "qa_score": None,
+                    "qa_reason": str(exc),
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+                detailed_results.append(failure_result)
+                log_query_result(log_store, "query_failed", failure_result)
+                save_latest_state(system, output_dir)
                 if args.fail_fast:
                     raise
 
@@ -661,6 +678,8 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             break
         system.ingest_record(pair.record)
         processed_records = index
+        if should_save_record_state(processed_records, args.state_save_every_records):
+            save_latest_state(system, output_dir)
         log_store.log(
             "progress",
             "record_ingested",
@@ -689,6 +708,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = system.save(output_dir / "memory_state.json")
+    save_latest_state(system, output_dir)
     paths = {
         "manifest": output_dir / "manifest.json",
         "state": state_path,
@@ -776,6 +796,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--log-dir", default="result/logs")
+    parser.add_argument("--state-save-every-records", type=int, default=10)
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)

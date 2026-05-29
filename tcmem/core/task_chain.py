@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -28,9 +29,10 @@ class PromptBundle:
 
 
 class TaskChainManager:
-    def __init__(self, owner_id: str, llm_client: object | None = None) -> None:
+    def __init__(self, owner_id: str, llm_client: object | None = None, log_store: object | None = None) -> None:
         self.owner_id = owner_id
         self.llm_client = llm_client
+        self.log_store = log_store
         self.tasks: dict[str, TaskChain] = {}
 
     def parse_session_records(self, session: SessionPayload) -> list[DialogueRecord]:
@@ -246,14 +248,62 @@ class TaskChainManager:
         generate = getattr(self.llm_client, "generate", None)
         if generate is None:
             raise RuntimeError(f"LLM client does not expose generate() for stage {bundle.name}")
-        response = generate(
-            bundle.user_prompt,
-            system_prompt=bundle.system_prompt,
-            temperature=0.0,
-            max_tokens=3000,
-            response_format={"type": "json_object"},
+        max_attempts = max(1, int(getattr(self.llm_client, "json_max_attempts", 3) or 3))
+        retry_delay = max(0.0, float(getattr(self.llm_client, "json_retry_delay", 0.5) or 0.0))
+        last_error: json.JSONDecodeError | None = None
+        for attempt in range(1, max_attempts + 1):
+            response = generate(
+                bundle.user_prompt,
+                system_prompt=bundle.system_prompt,
+                temperature=0.0,
+                max_tokens=3000,
+                response_format={"type": "json_object"},
+            )
+            response_text = str(response or "")
+            try:
+                return _extract_json_payload(response_text)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                self._log_llm_json_error(
+                    bundle=bundle,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    response_text=response_text,
+                    error=exc,
+                )
+                if attempt >= max_attempts:
+                    raise
+                if retry_delay > 0.0:
+                    time.sleep(retry_delay)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"LLM returned invalid JSON for stage {bundle.name}")
+
+    def _log_llm_json_error(
+        self,
+        *,
+        bundle: PromptBundle,
+        attempt: int,
+        max_attempts: int,
+        response_text: str,
+        error: json.JSONDecodeError,
+    ) -> None:
+        log = getattr(self.log_store, "log", None)
+        if log is None:
+            return
+        context = _prompt_context(bundle.user_prompt)
+        log(
+            "llm_errors",
+            "json_decode_failed",
+            stage=bundle.name,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            error_type=type(error).__name__,
+            message=str(error),
+            prompt_chars=len(bundle.user_prompt),
+            raw_response_excerpt=response_text[:1200],
+            **context,
         )
-        return _extract_json_payload(str(response or ""))
 
     def _task_summary(self, task: TaskChain) -> dict[str, Any]:
         return {
@@ -300,8 +350,25 @@ def _extract_json_payload(text: str) -> dict[str, Any] | list[Any]:
         stripped = re.sub(r"```$", "", stripped).strip()
     try:
         return json.loads(stripped)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if stripped.startswith(("{", "[")):
+            raise exc
         match = re.search(r"(\{.*\}|\[.*\])", stripped, flags=re.S)
         if not match:
             raise
         return json.loads(match.group(1))
+
+
+def _prompt_context(prompt: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(prompt)
+    except json.JSONDecodeError:
+        return {}
+    context: dict[str, Any] = {}
+    record = payload.get("record") if isinstance(payload, dict) else None
+    if isinstance(record, dict):
+        context["record_id"] = record.get("record_id", "")
+        context["session_uuid"] = record.get("session_uuid", "")
+    if isinstance(payload, dict) and "query" in payload:
+        context["query_excerpt"] = str(payload.get("query") or "")[:240]
+    return context

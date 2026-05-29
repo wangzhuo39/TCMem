@@ -22,7 +22,9 @@ def to_primitive(value: Any) -> Any:
 def dump_json(path: str | Path, value: Any) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(to_primitive(value), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = target.with_name(f".{target.name}.tmp")
+    tmp.write_text(json.dumps(to_primitive(value), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(target)
 
 
 def load_json(path: str | Path) -> Any:

@@ -58,6 +58,11 @@ conda run -n tcmem python -m tcmem.evals.realmem_top_session \
 Add `--with-qa` to generate answers from the top sessions and judge QA.
 During evaluation, `dataset.jsonl` records dataset-level events only. Use
 `progress.jsonl` for live progress across sessions, records, and queries.
+Completed or failed query payloads are appended to `query_results.jsonl`, so
+retrieval, QA scores, generated answers, and evidence text survive interrupted
+runs. The latest graph/task-chain snapshot is kept at
+`memory_state_latest.json` in the output directory. Malformed LLM JSON responses
+are retried and logged to `llm_errors.jsonl`.
 
 ## Minimal Usage
 

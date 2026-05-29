@@ -33,9 +33,15 @@ class MemorySystem:
         self.repository = FileSystemMemoryRepository(self.config.storage_path)
         self.llm_client = llm_client or self._client_from_config_or_none()
         self.graph = graph or DialogueGraphStore()
-        self.task_manager = task_manager or TaskChainManager(self.config.owner_id, llm_client=self.llm_client)
+        self.task_manager = task_manager or TaskChainManager(
+            self.config.owner_id,
+            llm_client=self.llm_client,
+            log_store=self.log_store,
+        )
         if self.task_manager.llm_client is None:
             self.task_manager.llm_client = self.llm_client
+        if getattr(self.task_manager, "log_store", None) is None:
+            self.task_manager.log_store = self.log_store
         self.embedding_client = embedding_client or EmbeddingClient(self.config)
         self.record_index = record_index or build_vector_index(
             self.config,

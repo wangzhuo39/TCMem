@@ -24,9 +24,13 @@ TCMem 参考 `xMemory` 的工程分层，但保留当前项目自己的特殊结
 
 3. Query routing 不做静默降级。
    `TaskChainManager.route_for_query()` 没有 LLM client 时直接报错：`LLM client missing for stage query_routing`。
+   LLM 返回非法 JSON 时会重试；最终失败会写入 `llm_errors.jsonl`，评估层记录该 query 失败并继续后续 query。
 
 4. Path A 和 Path B 保持简单加权。
    Path A 来自任务链节点，Path B 来自 record vector seeds + graph walk。最后按 `path_a_weight` 和 `path_b_weight` 融合。
+
+5. 评估中间结果实时保存。
+   每个 query 的完整结果追加到 `query_results.jsonl`。Graph/task-chain 的最新 JSON 快照保存为 `memory_state_latest.json`，默认每 10 条 record 和每个 query 后更新一次。
 
 ## 主要可调参数
 
@@ -36,6 +40,7 @@ TCMem 参考 `xMemory` 的工程分层，但保留当前项目自己的特殊结
 - Path A 内部: `path_a_semantic_weight`, `path_a_status_weight`, `path_a_chain_weight`
 - Path B 内部: `path_b_semantic_weight`, `path_b_graph_weight`, `graph_seed_limit`, `graph_walk_depth`
 - 状态/惩罚: `active_status_score`, `branched_status_score`, `deprecated_status_score`, `superseded_status_score`, `active_penalty`, `branched_penalty`, `deprecated_penalty`, `superseded_penalty`
+- 评估保存: `--state-save-every-records`
 
 ## 环境
 

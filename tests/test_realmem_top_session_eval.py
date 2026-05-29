@@ -1,13 +1,20 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 from tcmem.config import TCMemConfig
 from tcmem.evals.realmem_top_session import (
     PairRecord,
     build_progress_payload,
     compute_retrieval_metrics,
+    log_query_result,
     parse_args,
     ranked_sessions_from_traces,
+    save_latest_state,
+    should_save_record_state,
 )
+from tcmem.logging_utils import ModuleLogStore
 from tcmem.models import DialogueRecord
 
 
@@ -78,6 +85,54 @@ class RealMemTopSessionEvalTest(unittest.TestCase):
         self.assertEqual(payload["record_id"], "rec_s2_0003")
         self.assertEqual(payload["query_id"], "Q-0001")
         self.assertEqual(payload["elapsed_seconds"], 12.35)
+
+    def test_query_result_log_preserves_generation_and_qa_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            result = {
+                "query_id": "Q-0001",
+                "question": "question",
+                "retrieval_metrics": {"recall_all@20": 1.0},
+                "qa_score": 3,
+                "qa_reason": "uses all relevant memory",
+                "generation_result": {
+                    "generated_answer": "answer",
+                    "evidence_used": "session text",
+                    "evidence_session_uuids": ["s1"],
+                },
+            }
+
+            log_query_result(log_store, "query_completed", result)
+
+            entries = (Path(tmpdir) / "run" / "query_results.jsonl").read_text(encoding="utf-8").splitlines()
+        payload = json.loads(entries[-1])["payload"]
+        self.assertEqual(payload["query_id"], "Q-0001")
+        self.assertEqual(payload["generation_result"]["generated_answer"], "answer")
+        self.assertEqual(payload["qa_score"], 3)
+
+    def test_save_latest_state_writes_graph_and_task_chain_snapshot(self) -> None:
+        class FakeSystem:
+            def save(self, path):
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text(
+                    json.dumps({"graph": {"records": []}, "task_chains": {"tasks": []}}),
+                    encoding="utf-8",
+                )
+                return Path(path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = save_latest_state(FakeSystem(), Path(tmpdir))
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(state_path.name, "memory_state_latest.json")
+        self.assertIn("graph", state)
+        self.assertIn("task_chains", state)
+
+    def test_should_save_record_state_uses_positive_interval(self) -> None:
+        self.assertFalse(should_save_record_state(9, 10))
+        self.assertTrue(should_save_record_state(10, 10))
+        self.assertFalse(should_save_record_state(10, 0))
 
 
 if __name__ == "__main__":
