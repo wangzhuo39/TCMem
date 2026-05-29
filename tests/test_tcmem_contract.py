@@ -86,6 +86,12 @@ class TCMemContractTest(unittest.TestCase):
     def test_default_embedding_model_is_bge_m3(self) -> None:
         self.assertEqual(TCMemConfig().embedding_model, "BAAI/bge-m3")
 
+    def test_config_to_dict_redacts_api_key_by_default(self) -> None:
+        config = TCMemConfig(llm_api_key="secret")
+
+        self.assertEqual(config.to_dict()["llm_api_key"], "")
+        self.assertEqual(config.to_dict(include_secrets=True)["llm_api_key"], "secret")
+
     def _config(self, tmpdir: str) -> TCMemConfig:
         return TCMemConfig(
             owner_id="unit",

@@ -75,8 +75,11 @@ class TCMemConfig:
             "normalize": self.embedding_normalize,
         }
 
-    def to_dict(self) -> dict[str, Any]:
-        return {field_name: getattr(self, field_name) for field_name in self.__dataclass_fields__}
+    def to_dict(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        data = {field_name: getattr(self, field_name) for field_name in self.__dataclass_fields__}
+        if not include_secrets:
+            data["llm_api_key"] = ""
+        return data
 
     @classmethod
     def from_json(cls, path: str | Path) -> "TCMemConfig":
