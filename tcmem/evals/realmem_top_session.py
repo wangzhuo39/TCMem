@@ -13,6 +13,7 @@ from typing import Any
 from ..config import TCMemConfig
 from ..logging_utils import ModuleLogStore
 from ..models import DialogueRecord, DialogueTurn, RetrievalResult, SearchHit, SessionPayload
+from ..prompts import PromptRegistry
 from ..serialization import dump_json, to_primitive
 from ..core.memory_system import MemorySystem
 from ..utils.llm_client import OpenAICompatibleLLMClient
@@ -348,6 +349,7 @@ def evaluate_query_top_session(
     qa_model_name: str = "",
     with_qa: bool = False,
     log_store: ModuleLogStore | None = None,
+    prompt_registry: PromptRegistry | None = None,
 ) -> dict[str, Any]:
     retrieval = system.retrieve(example.question, top_k=retrieval_record_k)
     traces = dedupe_ranked_traces(traces_from_retrieval(retrieval, system, example.gold_session_uuids))
@@ -391,7 +393,7 @@ def evaluate_query_top_session(
             session_text_by_uuid=session_text_by_uuid,
             top_k=evidence_top_k,
         )
-        generated_answer = generate_answer(client, example.question, evidence_text)
+        generated_answer = generate_answer(client, example.question, evidence_text, prompt_registry=prompt_registry)
         judge_result = judge_qa_score(
             client,
             question=example.question,
@@ -400,6 +402,7 @@ def evaluate_query_top_session(
             candidate_answer=generated_answer,
             log_store=log_store,
             query_id=example.query_id,
+            prompt_registry=prompt_registry,
         )
         result["qa_score"] = judge_result["score"]
         result["qa_reason"] = judge_result["reason"]
@@ -415,16 +418,22 @@ def evaluate_query_top_session(
     return result
 
 
-def generate_answer(client: OpenAICompatibleLLMClient, question: str, evidence_text: str) -> str:
-    prompt = f"""You are a personal AI assistant helping the user with long-term tasks. Answer the latest query using only the reference memory.
-
-Reference memory:
-{evidence_text}
-
-Query: {question}
-
-Response:"""
-    return client.generate(prompt, system_prompt="realmem_answer_generation", temperature=0.2, max_tokens=1200).strip()
+def generate_answer(
+    client: OpenAICompatibleLLMClient,
+    question: str,
+    evidence_text: str,
+    *,
+    prompt_registry: PromptRegistry | None = None,
+) -> str:
+    registry = prompt_registry or PromptRegistry.default()
+    payload = {"reference_memory": evidence_text, "query": question}
+    rendered = registry.render(
+        "realmem_answer_generation",
+        payload_json=_prompt_json(payload),
+        question=question,
+        evidence_text=evidence_text,
+    )
+    return client.generate(rendered.user_prompt, system_prompt=rendered.system_prompt, temperature=0.2, max_tokens=1200).strip()
 
 
 def judge_qa_score(
@@ -436,25 +445,27 @@ def judge_qa_score(
     candidate_answer: str,
     log_store: ModuleLogStore | None = None,
     query_id: str = "",
+    prompt_registry: PromptRegistry | None = None,
 ) -> dict[str, Any]:
-    prompt = f"""Evaluate the consistency between the candidate answer and the user-related memory.
-
-Score 0: conflicts with memory.
-Score 1: generic but not conflicting.
-Score 2: uses part of the memory.
-Score 3: uses all relevant memory.
-
-Return only JSON: {{"score": 0, "reason": "..."}}
-
-Query: {question}
-User-related Memory: {gold_memory_text}
-Reference Answer: {reference_answer}
-Candidate Answer: {candidate_answer}
-"""
+    registry = prompt_registry or PromptRegistry.default()
+    payload = {
+        "query": question,
+        "user_related_memory": gold_memory_text,
+        "reference_answer": reference_answer,
+        "candidate_answer": candidate_answer,
+    }
+    rendered = registry.render(
+        "realmem_qa_judge",
+        payload_json=_prompt_json(payload),
+        question=question,
+        gold_memory_text=gold_memory_text,
+        reference_answer=reference_answer,
+        candidate_answer=candidate_answer,
+    )
     parsed = _generate_json_with_retries(
         client,
-        prompt,
-        system_prompt="realmem_qa_judge",
+        rendered.user_prompt,
+        system_prompt=rendered.system_prompt,
         temperature=0.0,
         max_tokens=1200,
         stage="qa_judge",
@@ -469,6 +480,10 @@ Candidate Answer: {candidate_answer}
     return {"score": score, "reason": str(parsed.get("reason", "") or "")}
 
 
+def _prompt_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _generate_json_with_retries(
     client: OpenAICompatibleLLMClient,
     prompt: str,
@@ -480,7 +495,7 @@ def _generate_json_with_retries(
     log_store: ModuleLogStore | None = None,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list[Any]:
-    max_attempts = max(1, int(getattr(client, "json_max_attempts", 3) or 3))
+    max_attempts = max(1, int(getattr(client, "json_max_attempts", 5) or 5))
     retry_delay = max(0.0, float(getattr(client, "json_retry_delay", 0.5) or 0.0))
     last_error: json.JSONDecodeError | None = None
     for attempt in range(1, max_attempts + 1):
@@ -600,6 +615,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         llm_base_url=runtime.base_url,
         llm_model=runtime.model,
         llm_timeout=runtime.timeout,
+        prompt_path=args.prompt_path,
     )
     system = MemorySystem(config=config, llm_client=client, log_store=log_store)
     if args.max_queries is not None:
@@ -688,6 +704,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     qa_model_name=runtime.model,
                     with_qa=args.with_qa,
                     log_store=log_store,
+                    prompt_registry=system.prompt_registry,
                 )
                 detailed_results.append(result)
                 retrieval_results[example.query_id] = result["retrieval_result"]
@@ -872,6 +889,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-walk-depth", type=int, default=defaults.graph_walk_depth)
     parser.add_argument("--path-a-weight", type=float, default=defaults.path_a_weight)
     parser.add_argument("--path-b-weight", type=float, default=defaults.path_b_weight)
+    parser.add_argument("--prompt-path", default=defaults.prompt_path)
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument("--with-qa", action="store_true")
     parser.add_argument("--run-name", default=None)

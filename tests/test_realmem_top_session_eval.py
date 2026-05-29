@@ -8,6 +8,7 @@ from tcmem.evals.realmem_top_session import (
     PairRecord,
     build_progress_payload,
     compute_retrieval_metrics,
+    generate_answer,
     judge_qa_score,
     log_query_result,
     parse_args,
@@ -17,9 +18,38 @@ from tcmem.evals.realmem_top_session import (
 )
 from tcmem.logging_utils import ModuleLogStore
 from tcmem.models import DialogueRecord
+from tcmem.prompts import PromptRegistry
 
 
 class RealMemTopSessionEvalTest(unittest.TestCase):
+    def test_generate_answer_uses_custom_prompt_registry(self) -> None:
+        class CapturingClient:
+            def __init__(self) -> None:
+                self.prompt = ""
+                self.system_prompt = ""
+
+            def generate(self, prompt: str, **kwargs) -> str:
+                self.prompt = prompt
+                self.system_prompt = kwargs["system_prompt"]
+                return "answer"
+
+        registry = PromptRegistry.from_mapping(
+            {
+                "realmem_answer_generation": {
+                    "system": "CUSTOM QA SYSTEM",
+                    "user": "Q={{question}}\nMEM={{evidence_text}}",
+                }
+            }
+        )
+        client = CapturingClient()
+
+        answer = generate_answer(client, "question text", "session memory", prompt_registry=registry)
+
+        self.assertEqual(answer, "answer")
+        self.assertEqual(client.system_prompt, "CUSTOM QA SYSTEM")
+        self.assertIn("Q=question text", client.prompt)
+        self.assertIn("MEM=session memory", client.prompt)
+
     def test_ranked_sessions_from_traces_deduplicates_sessions_by_first_record_rank(self) -> None:
         traces = [
             {"source_record_id": "r1", "source_session_uuid": "s1", "score": 0.9},

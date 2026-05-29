@@ -25,11 +25,18 @@ TCMem 参考 `xMemory` 的工程分层，但保留当前项目自己的特殊结
 3. Query routing 不做静默降级。
    `TaskChainManager.route_for_query()` 没有 LLM client 时直接报错：`LLM client missing for stage query_routing`。
    LLM 返回非法 JSON 时会重试；最终失败会写入 `llm_errors.jsonl`，评估层记录该 query 失败并继续后续 query。
+   Router 只接收压缩后的 task summary：`task_id`、`task_description`、最多 20 个 `entities`。Task 的 `topic` 和 task-level `status` 不再参与存储或路由。
 
-4. Path A 和 Path B 保持简单加权。
+4. Record routing 必须入链。
+   `TaskChainManager.route_record()` 要求每条 record 至少连接到一个已有 task 或创建一个新 task。LLM 返回空路由时会重试，默认最多 5 次；最终仍为空则报错，避免桥接 record 静默丢失。
+
+5. Task 元信息会定期刷新。
+   每个 task 默认每累计 5 条入链 record 触发一次 `task_metadata_refresh`，用最近节点刷新 `task_description` 和 `entities`，避免早期 task 描述长期偏离。
+
+6. Path A 和 Path B 保持简单加权。
    Path A 来自任务链节点，Path B 来自 record vector seeds + graph walk。最后按 `path_a_weight` 和 `path_b_weight` 融合。
 
-5. 评估中间结果实时保存。
+7. 评估中间结果实时保存。
    每个 query 的完整结果追加到 `query_results.jsonl`。Graph/task-chain 的最新 JSON 快照保存为 `memory_state_latest.json`，默认每 10 条 record 和每个 query 后更新一次。
 
 ## 主要可调参数
@@ -39,6 +46,7 @@ TCMem 参考 `xMemory` 的工程分层，但保留当前项目自己的特殊结
 - Path A/B: `path_a_weight`, `path_b_weight`
 - Path A 内部: `path_a_semantic_weight`, `path_a_status_weight`, `path_a_chain_weight`
 - Path B 内部: `path_b_semantic_weight`, `path_b_graph_weight`, `graph_seed_limit`, `graph_walk_depth`
+- task routing: `task_metadata_refresh_interval`, `task_router_entity_limit`
 - 状态/惩罚: `active_status_score`, `branched_status_score`, `deprecated_status_score`, `superseded_status_score`, `active_penalty`, `branched_penalty`, `deprecated_penalty`, `superseded_penalty`
 - 评估保存: `--state-save-every-records`
 

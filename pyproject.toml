@@ -31,6 +31,9 @@ dev = [
 where = ["."]
 include = ["tcmem*"]
 
+[tool.setuptools.package-data]
+"tcmem.prompts" = ["*.yaml", "*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

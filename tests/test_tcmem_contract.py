@@ -2,15 +2,17 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+import re
 
 import numpy as np
 
 from tcmem import DialogueRecord, TCMemConfig
 from tcmem.core.graph_store import DialogueGraphStore
 from tcmem.core.memory_system import MemorySystem
-from tcmem.core.task_chain import TaskChainManager
+from tcmem.core.task_chain import TaskChainManager, _extract_json_payload
 from tcmem.infrastructure.indices import NumpyVectorIndex, VectorIndexItem
 from tcmem.logging_utils import ModuleLogStore
+from tcmem.prompts import PromptRegistry
 
 
 class FakeEmbeddingClient:
@@ -52,39 +54,41 @@ class FakeEmbeddingClient:
 
 class FakeLLMClient:
     def generate(self, prompt: str, **_kwargs) -> str:
-        payload = json.loads(prompt)
-        if "record" in payload and "entities" in payload.get("schema", {}):
+        payload = _prompt_payload(prompt)
+        if "record" in payload:
             text = payload["record"].get("user_content", "")
             entities = ["alpha"] if "alpha" in text.lower() else ["beta"]
             return json.dumps({"entities": entities})
-        if "record" in payload and "new_tasks" in payload.get("schema", {}):
-            tasks = payload.get("tasks", [])
-            record_text = payload["record"].get("user_content", "")
+        if "current_record" in payload:
+            tasks = payload.get("task_catalog", [])
+            record_text = payload["current_record"].get("user_content", "")
             if tasks:
                 return json.dumps({"linked_task_ids": [tasks[0]["task_id"]], "new_tasks": [], "confidence": 1.0, "reason": "existing"})
             topic = "Alpha" if "alpha" in record_text.lower() else "Beta"
             return json.dumps(
                 {
                     "linked_task_ids": [],
-                    "new_tasks": [{"task_description": f"{topic} task", "topic": topic}],
+                    "new_tasks": [{"task_description": f"{topic} task"}],
                     "confidence": 1.0,
                     "reason": "new",
                 }
             )
+        if "task" in payload:
+            return json.dumps({"task_description": "Refreshed task", "entities": ["refreshed"]})
         if "query" in payload:
-            tasks = payload.get("tasks", [])
+            tasks = payload.get("task_catalog", [])
             query = payload["query"].lower()
             routed = [
                 task["task_id"]
                 for task in tasks
-                if task["topic"].lower() in query or task["task_description"].lower().split()[0] in query
+                if task["task_description"].lower().split()[0] in query
             ]
             return json.dumps({"routed_task_ids": routed or [task["task_id"] for task in tasks[:1]], "reason": "matched"})
         raise AssertionError(f"Unexpected prompt: {prompt}")
 
 
 class FlakyJSONLLMClient:
-    json_max_attempts = 3
+    json_max_attempts = 5
     json_retry_delay = 0.0
 
     def __init__(self) -> None:
@@ -97,7 +101,166 @@ class FlakyJSONLLMClient:
         return json.dumps({"routed_task_ids": ["task_manual"], "reason": "ok"})
 
 
+class EmptyRouteThenTaskLLMClient:
+    json_max_attempts = 5
+    json_retry_delay = 0.0
+
+    def __init__(self) -> None:
+        self.task_routing_calls = 0
+
+    def generate(self, prompt: str, **_kwargs) -> str:
+        payload = _prompt_payload(prompt)
+        if "current_record" in payload:
+            self.task_routing_calls += 1
+            if self.task_routing_calls < 3:
+                return json.dumps({"linked_task_ids": [], "new_tasks": [], "confidence": 0.1, "reason": "unsure"})
+            return json.dumps(
+                {
+                    "linked_task_ids": [],
+                    "new_tasks": [{"task_description": "Alpha handoff task"}],
+                    "confidence": 1.0,
+                    "reason": "created",
+                }
+            )
+        raise AssertionError(f"Unexpected prompt: {prompt}")
+
+
+class InvalidEntityThenValidLLMClient:
+    json_max_attempts = 5
+    json_retry_delay = 0.0
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, prompt: str, **_kwargs) -> str:
+        payload = _prompt_payload(prompt)
+        if "record" in payload:
+            self.calls += 1
+            if self.calls == 1:
+                return json.dumps({"schema": {"entities": "string"}})
+            return json.dumps({"entities": ["alpha"]})
+        raise AssertionError(f"Unexpected prompt: {prompt}")
+
+
+class AlwaysInvalidEntityLLMClient:
+    json_max_attempts = 2
+    json_retry_delay = 0.0
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, prompt: str, **_kwargs) -> str:
+        payload = _prompt_payload(prompt)
+        if "record" in payload:
+            self.calls += 1
+            copied_record = dict(payload["record"])
+            copied_record.pop("entities", None)
+            return json.dumps(copied_record)
+        raise AssertionError(f"Unexpected prompt: {prompt}")
+
+
+class CapturingLLMClient:
+    json_max_attempts = 5
+    json_retry_delay = 0.0
+
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        self.payloads: list[dict] = []
+        self.prompts: list[str] = []
+        self.kwargs: list[dict] = []
+
+    def generate(self, prompt: str, **_kwargs) -> str:
+        self.prompts.append(prompt)
+        self.kwargs.append(dict(_kwargs))
+        payload = _prompt_payload(prompt)
+        self.payloads.append(payload)
+        return json.dumps(self.response)
+
+
+def _prompt_payload(prompt: str) -> dict:
+    match = re.search(r"<[A-Za-z0-9_]*Input>\s*(\{.*?\}|\[.*?\])\s*</[A-Za-z0-9_]*Input>", prompt, flags=re.S)
+    if match is None:
+        match = re.search(r"## Input\s*(\{.*?\}|\[.*?\])\s*## Output format", prompt, flags=re.S | re.I)
+    parsed = json.loads(match.group(1)) if match else _extract_json_payload(prompt)
+    if not isinstance(parsed, dict):
+        raise AssertionError(f"Expected object prompt payload: {prompt}")
+    return parsed
+
+
 class TCMemContractTest(unittest.TestCase):
+    def test_default_prompts_use_handwritten_txt_templates_for_tcmem_stages(self) -> None:
+        registry = PromptRegistry.default()
+
+        for name in [
+            "entity_extraction",
+            "task_routing",
+            "query_routing",
+            "task_metadata_refresh",
+        ]:
+            rendered = registry.render(name, payload_json='{"ok": true}')
+            self.assertEqual(rendered.system_prompt, "")
+            self.assertIn("{{payload_json}}", Path(f"tcmem/prompts/{name}.txt").read_text(encoding="utf-8"))
+            self.assertIn('{"ok": true}', rendered.user_prompt)
+            self.assertIn("## Input", rendered.user_prompt)
+            self.assertIn("## Output format", rendered.user_prompt)
+
+    def test_realmem_default_prompts_match_realmembench_eval_style(self) -> None:
+        registry = PromptRegistry.default()
+
+        answer = registry.render("realmem_answer_generation", question="question", evidence_text="memory")
+        judge = registry.render(
+            "realmem_qa_judge",
+            question="question",
+            gold_memory_text="gold memory",
+            reference_answer="reference",
+            candidate_answer="candidate",
+        )
+
+        self.assertEqual(answer.system_prompt, "")
+        self.assertIn("Memories:\nmemory", answer.user_prompt)
+        self.assertIn("Query: question", answer.user_prompt)
+        self.assertEqual(judge.system_prompt, "")
+        self.assertIn("Your task is to evaluate the consistency", judge.user_prompt)
+        self.assertIn("### Input Data", judge.user_prompt)
+        self.assertIn("4. Candidate Answer: candidate", judge.user_prompt)
+
+    def test_prompt_registry_loads_custom_yaml_and_renders_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_path = Path(tmpdir) / "prompts.yaml"
+            prompt_path.write_text(
+                """
+custom_stage:
+  system: custom system
+  user: |
+    payload={{payload_json}}
+    question={{question}}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            registry = PromptRegistry.from_path(prompt_path)
+            rendered = registry.render("custom_stage", payload_json='{"ok": true}', question="hello")
+
+        self.assertEqual(rendered.system_prompt, "custom system")
+        self.assertIn('payload={"ok": true}', rendered.user_prompt)
+        self.assertIn("question=hello", rendered.user_prompt)
+
+    def test_task_chain_manager_uses_custom_prompt_registry(self) -> None:
+        registry = PromptRegistry.from_mapping(
+            {
+                "entity_extraction": {
+                    "system": "CUSTOM ENTITY SYSTEM",
+                    "user": "{{payload_json}}",
+                }
+            }
+        )
+        llm = CapturingLLMClient({"entities": ["alpha"]})
+        manager = TaskChainManager("unit", llm_client=llm, prompt_registry=registry)
+
+        manager.extract_record_entities(self._record("rec_alpha", "alpha entity"))
+
+        self.assertEqual(llm.kwargs[-1]["system_prompt"], "CUSTOM ENTITY SYSTEM")
+
     def test_default_embedding_model_is_bge_m3(self) -> None:
         self.assertEqual(TCMemConfig().embedding_model, "BAAI/bge-m3")
 
@@ -175,7 +338,7 @@ class TCMemContractTest(unittest.TestCase):
             llm = FlakyJSONLLMClient()
             manager = TaskChainManager("unit", llm_client=llm, log_store=log_store)
             record = self._record("rec_alpha", "alpha project decision", entities=["alpha"])
-            task = manager.create_task_from_record(record, {"task_description": "Alpha task", "topic": "Alpha"})
+            task = manager.create_task_from_record(record, {"task_description": "Alpha task"})
             task.task_id = "task_manual"
             manager.tasks = {"task_manual": task}
 
@@ -189,6 +352,110 @@ class TCMemContractTest(unittest.TestCase):
         self.assertEqual(payload["stage"], "query_routing")
         self.assertEqual(payload["attempt"], 1)
         self.assertIn("raw_response_excerpt", payload)
+
+    def test_record_routing_retries_empty_route_until_a_task_is_selected(self) -> None:
+        llm = EmptyRouteThenTaskLLMClient()
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha process handoff")
+
+        decision = manager.route_record(record)
+
+        self.assertEqual(llm.task_routing_calls, 3)
+        self.assertEqual(len(decision.routed_task_ids), 1)
+        self.assertEqual(manager.tasks[decision.routed_task_ids[0]].task_description, "Alpha handoff task")
+
+    def test_record_routing_accepts_schema_wrapped_response(self) -> None:
+        llm = CapturingLLMClient(
+            {
+                "schema": {
+                    "linked_task_ids": [],
+                    "new_tasks": [{"task_description": "Alpha schema task"}],
+                    "confidence": 1.0,
+                    "reason": "wrapped",
+                }
+            }
+        )
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha schema handoff")
+
+        decision = manager.route_record(record)
+
+        self.assertEqual(len(decision.routed_task_ids), 1)
+        self.assertEqual(manager.tasks[decision.routed_task_ids[0]].task_description, "Alpha schema task")
+
+    def test_entity_extraction_prefers_top_level_fields_over_prompt_schema(self) -> None:
+        llm = CapturingLLMClient({"entities": ["alpha"], "schema": {"entities": "string"}})
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha entity")
+
+        entities = manager.extract_record_entities(record)
+
+        self.assertEqual(entities, ["alpha"])
+
+    def test_entity_extraction_retries_invalid_payload_shape(self) -> None:
+        llm = InvalidEntityThenValidLLMClient()
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha entity")
+
+        entities = manager.extract_record_entities(record)
+
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(entities, ["alpha"])
+
+    def test_entity_extraction_keeps_empty_entities_after_invalid_retries(self) -> None:
+        llm = AlwaysInvalidEntityLLMClient()
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha entity")
+
+        entities = manager.extract_record_entities(record)
+
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(entities, [])
+
+    def test_router_task_summary_omits_unused_fields_and_limits_entities(self) -> None:
+        llm = CapturingLLMClient({"routed_task_ids": ["task_manual"], "reason": "matched"})
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha project decision", entities=[f"e{i}" for i in range(30)])
+        task = manager.create_task_from_record(record, {"task_description": "Alpha task"})
+        task.task_id = "task_manual"
+        manager.tasks = {"task_manual": task}
+
+        manager.route_for_query("alpha question")
+
+        task_summary = llm.payloads[-1]["task_catalog"][0]
+        self.assertEqual(set(task_summary), {"task_id", "task_description", "entities"})
+        self.assertEqual(task_summary["entities"], [f"e{i}" for i in range(20)])
+
+    def test_record_router_payload_omits_stable_session_and_metadata_fields(self) -> None:
+        llm = CapturingLLMClient(
+            {
+                "linked_task_ids": [],
+                "new_tasks": [{"task_description": "Alpha task"}],
+                "confidence": 1.0,
+                "reason": "new",
+            }
+        )
+        manager = TaskChainManager("unit", llm_client=llm)
+        record = self._record("rec_alpha", "alpha project decision", entities=["alpha"])
+        record.assistant_content = "assistant reply"
+        record.metadata["unused"] = "value"
+
+        manager.route_record(record)
+
+        routed_record = llm.payloads[-1]["current_record"]
+        self.assertEqual(set(routed_record), {"record_id", "user_content", "assistant_content", "entities"})
+
+    def test_task_metadata_refreshes_on_configured_interval(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=2)
+        task = manager.create_task_from_record(self._record("rec_alpha", "alpha seed"), {"task_description": "Alpha task"})
+
+        manager.apply_record(task.task_id, self._record("rec_1", "alpha first"))
+        self.assertEqual(task.task_description, "Alpha task")
+
+        manager.apply_record(task.task_id, self._record("rec_2", "alpha second"))
+
+        self.assertEqual(task.task_description, "Refreshed task")
+        self.assertEqual(task.entities, ["refreshed"])
 
     def test_state_round_trip_preserves_graph_and_task_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

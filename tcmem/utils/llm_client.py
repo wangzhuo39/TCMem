@@ -9,7 +9,7 @@ class OpenAICompatibleLLMClient:
             raise ValueError("api_key is required for OpenAICompatibleLLMClient")
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self.model = model
-        self.json_max_attempts = 3
+        self.json_max_attempts = 5
         self.json_retry_delay = 0.5
 
     def generate(

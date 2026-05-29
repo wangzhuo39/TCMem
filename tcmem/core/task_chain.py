@@ -16,9 +16,16 @@ from ..models import (
     SessionPayload,
     TaskChain,
     TaskChainNode,
-    TaskStatus,
 )
+from ..prompts import PromptRegistry
 from ..serialization import to_primitive
+
+
+DEFAULT_JSON_MAX_ATTEMPTS = 5
+DEFAULT_TASK_METADATA_REFRESH_INTERVAL = 5
+DEFAULT_ROUTER_ENTITY_LIMIT = 20
+TASK_REFRESH_RECENT_NODE_LIMIT = 5
+TASK_REFRESH_TEXT_LIMIT = 500
 
 
 @dataclass(slots=True)
@@ -29,10 +36,22 @@ class PromptBundle:
 
 
 class TaskChainManager:
-    def __init__(self, owner_id: str, llm_client: object | None = None, log_store: object | None = None) -> None:
+    def __init__(
+        self,
+        owner_id: str,
+        llm_client: object | None = None,
+        log_store: object | None = None,
+        *,
+        task_metadata_refresh_interval: int = DEFAULT_TASK_METADATA_REFRESH_INTERVAL,
+        router_entity_limit: int = DEFAULT_ROUTER_ENTITY_LIMIT,
+        prompt_registry: PromptRegistry | None = None,
+    ) -> None:
         self.owner_id = owner_id
         self.llm_client = llm_client
         self.log_store = log_store
+        self.task_metadata_refresh_interval = task_metadata_refresh_interval
+        self.router_entity_limit = router_entity_limit
+        self.prompt_registry = prompt_registry or PromptRegistry.default()
         self.tasks: dict[str, TaskChain] = {}
 
     def parse_session_records(self, session: SessionPayload) -> list[DialogueRecord]:
@@ -80,84 +99,83 @@ class TaskChainManager:
         return records
 
     def extract_record_entities(self, record: DialogueRecord) -> list[str]:
-        parsed = self._call_llm_json(
-            PromptBundle(
-                name="entity_extraction",
-                system_prompt="Extract compact entity strings from a dialogue record. Return JSON only.",
-                user_prompt=json.dumps({"record": to_primitive(record), "schema": {"entities": ["string"]}}, ensure_ascii=False),
-            )
+        payload = {"record": to_primitive(record)}
+        rendered = self.prompt_registry.render("entity_extraction", payload_json=_json_dumps(payload))
+        bundle = PromptBundle(
+            name="entity_extraction",
+            system_prompt=rendered.system_prompt,
+            user_prompt=rendered.user_prompt,
         )
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("entities"), list):
-            raise RuntimeError(f"LLM entity extraction returned invalid payload for record {record.record_id}")
-        record.entities = self._normalize_entities([*record.entities, *parsed["entities"]])
+        max_attempts = self._json_max_attempts()
+        retry_delay = self._json_retry_delay()
+        for attempt in range(1, max_attempts + 1):
+            parsed = self._call_llm_json(bundle)
+            if isinstance(parsed, dict):
+                parsed = _unwrap_schema_response(parsed, expected_keys={"entities"})
+            if isinstance(parsed, dict) and isinstance(parsed.get("entities"), list):
+                record.entities = self._normalize_entities([*record.entities, *parsed["entities"]])
+                return record.entities
+            self._log_invalid_llm_payload(
+                stage="entity_extraction",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                parsed=parsed,
+                record_id=record.record_id,
+            )
+            if attempt >= max_attempts:
+                break
+            if retry_delay > 0.0:
+                time.sleep(retry_delay)
         return record.entities
 
     def route_record(self, record: DialogueRecord) -> RouteDecision:
-        parsed = self._call_llm_json(
-            PromptBundle(
-                name="task_routing",
-                system_prompt="Route a dialogue record to existing task chains or create new task specs. Return JSON only.",
-                user_prompt=json.dumps(
-                    {
-                        "record": to_primitive(record),
-                        "tasks": [self._task_summary(task) for task in self.tasks.values()],
-                        "schema": {
-                            "linked_task_ids": ["task id"],
-                            "new_tasks": [{"task_description": "string", "topic": "string"}],
-                            "confidence": 0.0,
-                            "reason": "string",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        )
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"LLM task routing returned invalid payload for record {record.record_id}")
-
-        linked_task_ids = [str(task_id) for task_id in parsed.get("linked_task_ids", []) or [] if str(task_id) in self.tasks]
-        created_task_ids: list[str] = []
-        for spec in parsed.get("new_tasks", []) or []:
-            if not isinstance(spec, dict):
-                continue
-            created_task_ids.append(self.create_task_from_record(record, spec).task_id)
-        routed_task_ids = self._unique([*linked_task_ids, *created_task_ids])
-        return RouteDecision(
-            linked_task_ids=linked_task_ids,
-            created_task_ids=created_task_ids,
-            routed_task_ids=routed_task_ids,
-            confidence=float(parsed.get("confidence", 0.0) or 0.0),
-            reason=str(parsed.get("reason", "") or ""),
-        )
+        max_attempts = self._json_max_attempts()
+        retry_delay = self._json_retry_delay()
+        last_decision: RouteDecision | None = None
+        for attempt in range(1, max_attempts + 1):
+            parsed = self._call_llm_json(self._task_routing_bundle(record))
+            if isinstance(parsed, dict):
+                parsed = _unwrap_schema_response(parsed, expected_keys={"linked_task_ids", "new_tasks"})
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"LLM task routing returned invalid payload for record {record.record_id}")
+            decision = self._route_decision_from_payload(record, parsed)
+            if decision.routed_task_ids:
+                return decision
+            last_decision = decision
+            self._log_empty_record_route(record=record, attempt=attempt, max_attempts=max_attempts, reason=decision.reason)
+            if attempt >= max_attempts:
+                break
+            if retry_delay > 0.0:
+                time.sleep(retry_delay)
+        reason = last_decision.reason if last_decision is not None else ""
+        raise RuntimeError(f"LLM task routing returned no task for record {record.record_id} after {max_attempts} attempts: {reason}")
 
     def route_for_query(self, query: str) -> list[str]:
+        payload = {
+            "query": query,
+            "task_catalog": [self._task_summary(task) for task in self.tasks.values()],
+        }
+        rendered = self.prompt_registry.render("query_routing", payload_json=_json_dumps(payload))
         parsed = self._call_llm_json(
             PromptBundle(
                 name="query_routing",
-                system_prompt="Route a user query to relevant task chains. Return JSON only.",
-                user_prompt=json.dumps(
-                    {
-                        "query": query,
-                        "tasks": [self._task_summary(task) for task in self.tasks.values()],
-                        "schema": {"routed_task_ids": ["task id"], "reason": "string"},
-                    },
-                    ensure_ascii=False,
-                ),
+                system_prompt=rendered.system_prompt,
+                user_prompt=rendered.user_prompt,
             )
         )
+        if isinstance(parsed, dict):
+            parsed = _unwrap_schema_response(parsed, expected_keys={"routed_task_ids"})
         if not isinstance(parsed, dict):
             raise RuntimeError("LLM query routing returned invalid payload")
         return [str(task_id) for task_id in parsed.get("routed_task_ids", []) or [] if str(task_id) in self.tasks]
 
     def create_task_from_record(self, record: DialogueRecord, spec: dict[str, Any]) -> TaskChain:
         task_description = str(spec.get("task_description", "") or "").strip()
-        topic = str(spec.get("topic", "") or "").strip()
-        if not task_description or not topic:
-            raise ValueError("new task spec must include task_description and topic")
+        if not task_description:
+            raise ValueError("new task spec must include task_description")
         task = TaskChain(
             task_id=f"task_{uuid4().hex[:8]}",
             task_description=task_description,
-            topic=topic,
             owner_id=self.owner_id,
             created_at=record.current_time,
             updated_at=record.current_time,
@@ -194,6 +212,7 @@ class TaskChainManager:
         if record.record_id not in task.record_ids:
             task.record_ids.append(record.record_id)
         task.entities = self._normalize_entities([*task.entities, *record.entities])
+        self._maybe_refresh_task_metadata(task)
         return node
 
     def get_task(self, task_id: str) -> TaskChain | None:
@@ -203,15 +222,27 @@ class TaskChainManager:
         return {"owner_id": self.owner_id, "tasks": [to_primitive(task) for task in self.tasks.values()]}
 
     @classmethod
-    def from_state(cls, state: dict, *, llm_client: object | None = None) -> "TaskChainManager":
-        manager = cls(owner_id=state.get("owner_id", "default"), llm_client=llm_client)
+    def from_state(
+        cls,
+        state: dict,
+        *,
+        llm_client: object | None = None,
+        task_metadata_refresh_interval: int = DEFAULT_TASK_METADATA_REFRESH_INTERVAL,
+        router_entity_limit: int = DEFAULT_ROUTER_ENTITY_LIMIT,
+        prompt_registry: PromptRegistry | None = None,
+    ) -> "TaskChainManager":
+        manager = cls(
+            owner_id=state.get("owner_id", "default"),
+            llm_client=llm_client,
+            task_metadata_refresh_interval=task_metadata_refresh_interval,
+            router_entity_limit=router_entity_limit,
+            prompt_registry=prompt_registry,
+        )
         for task_data in state.get("tasks", []) or []:
             task = TaskChain(
                 task_id=task_data["task_id"],
-                task_description=task_data["task_description"],
-                topic=task_data["topic"],
+                task_description=task_data.get("task_description") or task_data.get("topic", ""),
                 owner_id=task_data.get("owner_id", manager.owner_id),
-                status=TaskStatus(task_data.get("status", TaskStatus.ACTIVE.value)),
                 created_at=task_data.get("created_at", ""),
                 updated_at=task_data.get("updated_at", ""),
                 entities=task_data.get("entities", []) or [],
@@ -248,8 +279,8 @@ class TaskChainManager:
         generate = getattr(self.llm_client, "generate", None)
         if generate is None:
             raise RuntimeError(f"LLM client does not expose generate() for stage {bundle.name}")
-        max_attempts = max(1, int(getattr(self.llm_client, "json_max_attempts", 3) or 3))
-        retry_delay = max(0.0, float(getattr(self.llm_client, "json_retry_delay", 0.5) or 0.0))
+        max_attempts = self._json_max_attempts()
+        retry_delay = self._json_retry_delay()
         last_error: json.JSONDecodeError | None = None
         for attempt in range(1, max_attempts + 1):
             response = generate(
@@ -308,12 +339,134 @@ class TaskChainManager:
     def _task_summary(self, task: TaskChain) -> dict[str, Any]:
         return {
             "task_id": task.task_id,
-            "topic": task.topic,
             "task_description": task.task_description,
-            "status": task.status.value,
-            "entities": task.entities,
-            "record_count": len(task.record_ids),
+            "entities": task.entities[: self.router_entity_limit],
         }
+
+    def _task_routing_bundle(self, record: DialogueRecord) -> PromptBundle:
+        payload = {
+            "current_record": self._record_router_payload(record),
+            "task_catalog": [self._task_summary(task) for task in self.tasks.values()],
+        }
+        rendered = self.prompt_registry.render("task_routing", payload_json=_json_dumps(payload))
+        return PromptBundle(
+            name="task_routing",
+            system_prompt=rendered.system_prompt,
+            user_prompt=rendered.user_prompt,
+        )
+
+    def _record_router_payload(self, record: DialogueRecord) -> dict[str, Any]:
+        return {
+            "record_id": record.record_id,
+            "user_content": record.user_content,
+            "assistant_content": record.assistant_content,
+            "entities": list(record.entities),
+        }
+
+    def _route_decision_from_payload(self, record: DialogueRecord, parsed: dict[str, Any]) -> RouteDecision:
+        linked_task_ids = [str(task_id) for task_id in parsed.get("linked_task_ids", []) or [] if str(task_id) in self.tasks]
+        created_task_ids: list[str] = []
+        for spec in parsed.get("new_tasks", []) or []:
+            if not isinstance(spec, dict):
+                continue
+            if not str(spec.get("task_description", "") or "").strip():
+                continue
+            created_task_ids.append(self.create_task_from_record(record, spec).task_id)
+        routed_task_ids = self._unique([*linked_task_ids, *created_task_ids])
+        return RouteDecision(
+            linked_task_ids=linked_task_ids,
+            created_task_ids=created_task_ids,
+            routed_task_ids=routed_task_ids,
+            confidence=float(parsed.get("confidence", 0.0) or 0.0),
+            reason=str(parsed.get("reason", "") or ""),
+        )
+
+    def _maybe_refresh_task_metadata(self, task: TaskChain) -> None:
+        interval = int(self.task_metadata_refresh_interval or 0)
+        if interval <= 0 or len(task.record_ids) % interval != 0:
+            return
+        self.refresh_task_metadata(task)
+
+    def refresh_task_metadata(self, task: TaskChain) -> None:
+        payload = {"task": self._task_refresh_payload(task)}
+        rendered = self.prompt_registry.render("task_metadata_refresh", payload_json=_json_dumps(payload))
+        parsed = self._call_llm_json(
+            PromptBundle(
+                name="task_metadata_refresh",
+                system_prompt=rendered.system_prompt,
+                user_prompt=rendered.user_prompt,
+            )
+        )
+        if isinstance(parsed, dict):
+            parsed = _unwrap_schema_response(parsed, expected_keys={"task_description", "entities"})
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"LLM task metadata refresh returned invalid payload for task {task.task_id}")
+        task_description = str(parsed.get("task_description", "") or "").strip()
+        if task_description:
+            task.task_description = task_description
+        if isinstance(parsed.get("entities"), list):
+            task.entities = self._normalize_entities(parsed["entities"])
+
+    def _task_refresh_payload(self, task: TaskChain) -> dict[str, Any]:
+        recent_nodes = sorted(task.nodes.values(), key=lambda item: item.position)[-TASK_REFRESH_RECENT_NODE_LIMIT:]
+        return {
+            "task_id": task.task_id,
+            "task_description": task.task_description,
+            "entities": task.entities[: self.router_entity_limit],
+            "recent_records": [
+                {
+                    "source_record_id": node.source_record_id,
+                    "summary": _short_text(node.summary, TASK_REFRESH_TEXT_LIMIT),
+                }
+                for node in recent_nodes
+            ],
+        }
+
+    def _json_max_attempts(self) -> int:
+        return max(1, int(getattr(self.llm_client, "json_max_attempts", DEFAULT_JSON_MAX_ATTEMPTS) or DEFAULT_JSON_MAX_ATTEMPTS))
+
+    def _json_retry_delay(self) -> float:
+        return max(0.0, float(getattr(self.llm_client, "json_retry_delay", 0.5) or 0.0))
+
+    def _log_empty_record_route(self, *, record: DialogueRecord, attempt: int, max_attempts: int, reason: str) -> None:
+        log = getattr(self.log_store, "log", None)
+        if log is None:
+            return
+        log(
+            "llm_errors",
+            "empty_record_route",
+            stage="task_routing",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            record_id=record.record_id,
+            reason=reason,
+        )
+
+    def _log_invalid_llm_payload(
+        self,
+        *,
+        stage: str,
+        attempt: int,
+        max_attempts: int,
+        parsed: Any,
+        record_id: str = "",
+    ) -> None:
+        log = getattr(self.log_store, "log", None)
+        if log is None:
+            return
+        try:
+            parsed_excerpt = json.dumps(to_primitive(parsed), ensure_ascii=False)[:1200]
+        except TypeError:
+            parsed_excerpt = str(parsed)[:1200]
+        log(
+            "llm_errors",
+            "invalid_payload",
+            stage=stage,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            record_id=record_id,
+            parsed_excerpt=parsed_excerpt,
+        )
 
     def _record_id(self, session_uuid: str, record_index: int) -> str:
         slug = re.sub(r"[^0-9A-Za-z]+", "_", session_uuid).strip("_") or "session"
@@ -359,16 +512,51 @@ def _extract_json_payload(text: str) -> dict[str, Any] | list[Any]:
         return json.loads(match.group(1))
 
 
+def _json_dumps(value: Any) -> str:
+    return json.dumps(to_primitive(value), ensure_ascii=False, indent=2)
+
+
+def _unwrap_schema_response(parsed: dict[str, Any], *, expected_keys: set[str] | None = None) -> dict[str, Any]:
+    if expected_keys and any(key in parsed for key in expected_keys):
+        return parsed
+    nested = parsed.get("schema")
+    if isinstance(nested, dict) and (not expected_keys or any(key in nested for key in expected_keys)):
+        return nested
+    return parsed
+
+
+def _short_text(text: Any, limit: int) -> str:
+    value = "" if text is None else str(text).replace("\n", " ").strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
 def _prompt_context(prompt: str) -> dict[str, Any]:
     try:
         payload = json.loads(prompt)
     except json.JSONDecodeError:
-        return {}
+        try:
+            payload = _extract_prompt_input_json(prompt)
+        except json.JSONDecodeError:
+            return {}
     context: dict[str, Any] = {}
-    record = payload.get("record") if isinstance(payload, dict) else None
+    record = None
+    if isinstance(payload, dict):
+        record = payload.get("record") or payload.get("current_record")
     if isinstance(record, dict):
         context["record_id"] = record.get("record_id", "")
         context["session_uuid"] = record.get("session_uuid", "")
     if isinstance(payload, dict) and "query" in payload:
         context["query_excerpt"] = str(payload.get("query") or "")[:240]
     return context
+
+
+def _extract_prompt_input_json(prompt: str) -> dict[str, Any] | list[Any]:
+    match = re.search(r"<[A-Za-z0-9_]*Input>\s*(\{.*?\}|\[.*?\])\s*</[A-Za-z0-9_]*Input>", prompt, flags=re.S)
+    if match:
+        return json.loads(match.group(1))
+    match = re.search(r"## Input\s*(\{.*?\}|\[.*?\])\s*## Output format", prompt, flags=re.S | re.I)
+    if match:
+        return json.loads(match.group(1))
+    return _extract_json_payload(prompt)

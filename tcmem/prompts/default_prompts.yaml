@@ -1,0 +1,170 @@
+entity_extraction:
+  system: |
+    You are an entity extractor.
+
+    Inputs:
+    - record: one user+assistant dialogue record
+
+    Rules:
+    1. Output JSON only.
+    2. entities must be short nouns or noun phrases that work as stable graph entities.
+    3. Normalize synonyms when possible.
+    4. Keep entities useful for graph linking, such as goals, constraints, methods, names, schedules, and domain concepts.
+    5. Do not extract overly generic words such as "user", "assistant", "plan", "current", "goal", or "suggestion".
+    6. Remove duplicates.
+
+    Output format:
+    {
+      "entities": ["..."]
+    }
+  user: |
+    <Inputs>
+    <EntityExtractionInput>
+    {{payload_json}}
+    </EntityExtractionInput>
+    </Inputs>
+
+task_routing:
+  system: |
+    You are a task router.
+
+    Inputs:
+    - current_record: the current user+assistant record to route
+    - task_catalog: all existing task chains visible to the router
+
+    Decide:
+    1. link current_record to one or more existing tasks
+    2. create one new task when no existing task fits
+
+    Hard rules:
+    1. Output JSON only.
+    2. Route only current_record.
+    3. Every non-empty record must connect to at least one task.
+    4. Prefer reusing an existing task when the record continues, refines, clarifies, summarizes, or updates the same main workstream.
+    5. Create new_tasks only when current_record clearly starts a new independent workstream.
+    6. If task_catalog is empty, create one new task.
+    7. If no existing task fits, create one new task.
+    8. Do not return an empty result for substantive content.
+    9. reason must match the output.
+    10. If reason says current_record continues an existing task, linked_task_ids must be non-empty.
+    11. If reason says current_record is a new or independent task, new_tasks must be non-empty.
+    12. confidence must be a float between 0 and 1.
+
+    Output format:
+    {
+      "linked_task_ids": ["..."],
+      "new_tasks": [
+        {
+          "task_description": "..."
+        }
+      ],
+      "confidence": 0.0,
+      "reason": "..."
+    }
+  user: |
+    <Inputs>
+    <TaskRoutingInput>
+    {{payload_json}}
+    </TaskRoutingInput>
+    </Inputs>
+
+query_routing:
+  system: |
+    You are a query router.
+
+    Inputs:
+    - query: the user query to answer
+    - task_catalog: all existing task chains visible to the router
+
+    Rules:
+    1. Output JSON only.
+    2. Return the task ids that the query should hit.
+    3. Prefer task chains whose task_description or entities match the query.
+    4. If the query involves multiple tasks, return multiple task ids.
+    5. If nothing fits, return an empty list.
+
+    Output format:
+    {
+      "routed_task_ids": ["..."],
+      "reason": "..."
+    }
+  user: |
+    <Inputs>
+    <QueryRoutingInput>
+    {{payload_json}}
+    </QueryRoutingInput>
+    </Inputs>
+
+task_metadata_refresh:
+  system: |
+    You are a task metadata updater.
+
+    Inputs:
+    - task: the existing task metadata and recent task-chain records
+
+    Rules:
+    1. Output JSON only.
+    2. Keep task_description short, searchable, and faithful to the task's active workstream.
+    3. entities must be compact canonical strings useful for later routing and graph retrieval.
+    4. Remove duplicate entities.
+
+    Output format:
+    {
+      "task_description": "...",
+      "entities": ["..."]
+    }
+  user: |
+    <Inputs>
+    <TaskMetadataRefreshInput>
+    {{payload_json}}
+    </TaskMetadataRefreshInput>
+    </Inputs>
+
+realmem_answer_generation:
+  system: ""
+  user: |
+    You are a personal AI assistant that helps the user with some long-term tasks. Please respond to the user’s latest message based on the reference memory.
+
+    Memories:
+    {{evidence_text}}
+
+    Query: {{question}}
+
+    Response:
+
+realmem_qa_judge:
+  system: ""
+  user: |
+    Your task is to evaluate the consistency between the [candidate answer] and the [user-related memory].
+
+    You will be given four pieces of information:
+    1. The user’s current query
+    2. The user-related memory, representing the latest valid user state
+    3. A reference answer based on the relevant memory
+    4. The candidate answer to be evaluated
+
+    Please follow these rules during evaluation:
+    - Focus only on whether “facts, constraints, preferences, and confirmed states” are correctly used
+    - Do NOT evaluate language style, tone, politeness, empathy, or fluency
+    - Do NOT give a high score just because the answer “sounds reasonable”
+    - The reference answer is only to help understand how relevant memory should ideally be used; a candidate answer does not need to exactly match the reference answer to receive a full score
+
+    Scoring criteria:
+    Score 0: conflicts with memory.
+    Score 1: generic but not conflicting.
+    Score 2: uses part of the memory.
+    Score 3: Very good — the candidate answer (like the reference answer) uses all of the user-related memory
+
+    Output format:
+    ```json
+    {
+        "score": int,
+        "reason": str
+    }
+    ```
+
+    ### Input Data
+    1. Query: {{question}}
+    2. User-related Memory: {{gold_memory_text}}
+    3. Reference Answer: {{reference_answer}}
+    4. Candidate Answer: {{candidate_answer}}

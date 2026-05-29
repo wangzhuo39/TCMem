@@ -7,13 +7,6 @@ from typing import Any
 from uuid import uuid4
 
 
-class TaskStatus(str, Enum):
-    ACTIVE = "active"
-    COMPLETED = "completed"
-    BLOCKED = "blocked"
-    CANCELLED = "cancelled"
-
-
 class ChainNodeStatus(str, Enum):
     ACTIVE = "active"
     BRANCHED = "branched"
@@ -112,9 +105,7 @@ class TaskChainNode:
 class TaskChain:
     task_id: str
     task_description: str
-    topic: str
     owner_id: str
-    status: TaskStatus = TaskStatus.ACTIVE
     created_at: str = ""
     updated_at: str = ""
     entities: list[str] = field(default_factory=list)

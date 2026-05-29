@@ -6,6 +6,7 @@ from ..config import TCMemConfig
 from ..infrastructure.indices import VectorIndex, build_vector_index
 from ..logging_utils import ModuleLogStore
 from ..models import DialogueRecord, IngestionResult, RetrievalResult, SessionPayload
+from ..prompts import PromptRegistry
 from ..search.unified_search import UnifiedSearchService
 from ..serialization import to_primitive
 from ..storage.repositories import FileSystemMemoryRepository
@@ -32,16 +33,24 @@ class MemorySystem:
         self.log_store = log_store or ModuleLogStore(base_dir=self.config.log_path)
         self.repository = FileSystemMemoryRepository(self.config.storage_path)
         self.llm_client = llm_client or self._client_from_config_or_none()
+        self.prompt_registry = PromptRegistry.load(self.config.prompt_path)
         self.graph = graph or DialogueGraphStore()
         self.task_manager = task_manager or TaskChainManager(
             self.config.owner_id,
             llm_client=self.llm_client,
             log_store=self.log_store,
+            task_metadata_refresh_interval=self.config.task_metadata_refresh_interval,
+            router_entity_limit=self.config.task_router_entity_limit,
+            prompt_registry=self.prompt_registry,
         )
         if self.task_manager.llm_client is None:
             self.task_manager.llm_client = self.llm_client
         if getattr(self.task_manager, "log_store", None) is None:
             self.task_manager.log_store = self.log_store
+        self.task_manager.task_metadata_refresh_interval = self.config.task_metadata_refresh_interval
+        self.task_manager.router_entity_limit = self.config.task_router_entity_limit
+        if self.config.prompt_path:
+            self.task_manager.prompt_registry = self.prompt_registry
         self.embedding_client = embedding_client or EmbeddingClient(self.config)
         self.record_index = record_index or build_vector_index(
             self.config,
@@ -120,7 +129,13 @@ class MemorySystem:
         state = load_json(path)
         loaded_config = config or TCMemConfig(**state.get("config", {}))
         graph = DialogueGraphStore.from_state(state.get("graph", {}))
-        task_manager = TaskChainManager.from_state(state.get("task_chains", {}), llm_client=llm_client)
+        task_manager = TaskChainManager.from_state(
+            state.get("task_chains", {}),
+            llm_client=llm_client,
+            task_metadata_refresh_interval=loaded_config.task_metadata_refresh_interval,
+            router_entity_limit=loaded_config.task_router_entity_limit,
+            prompt_registry=PromptRegistry.load(loaded_config.prompt_path),
+        )
         return cls(
             config=loaded_config,
             graph=graph,

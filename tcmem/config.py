@@ -35,6 +35,9 @@ class TCMemConfig:
     graph_walk_depth: int = 2
     routed_task_score: float = 1.0
     unrouted_task_score: float = 0.3
+    task_metadata_refresh_interval: int = 5
+    task_router_entity_limit: int = 20
+    prompt_path: str = ""
 
     active_status_score: float = 1.0
     branched_status_score: float = 0.6
@@ -56,6 +59,7 @@ class TCMemConfig:
         self.storage_path = str(Path(self.storage_path))
         self.log_path = str(Path(self.log_path))
         self.vector_index_path = str(Path(self.vector_index_path))
+        self.prompt_path = str(Path(self.prompt_path)) if self.prompt_path else ""
         backend = self.vector_index_backend.lower()
         if backend not in {"chroma", "numpy", "faiss"}:
             raise ValueError("vector_index_backend must be one of: chroma, numpy, faiss")
