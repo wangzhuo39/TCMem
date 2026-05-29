@@ -230,7 +230,7 @@ graph_seed_limit      = 12
 graph_bm25_seed_limit = 12
 ```
 
-If the same record appears in both seed sets, its seed strength is blended as:
+The union of vector and BM25 seeds is merged, and each merged seed uses this blended score, with any missing signal contributing `0`:
 
 ```text
 seed_score =
@@ -269,7 +269,7 @@ graph_vector_seed_weight = 0.7
 graph_bm25_seed_weight   = 0.3
 ```
 
-Task-chain context still applies status/route penalties after this base score.
+Task-chain context may apply a status-based penalty after `base_score`, while route context is used only when selecting the best matching chain context.
 
 ### Step 4: Path Fusion
 
