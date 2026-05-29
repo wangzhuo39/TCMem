@@ -8,6 +8,7 @@ from tcmem.evals.realmem_top_session import (
     PairRecord,
     build_progress_payload,
     compute_retrieval_metrics,
+    judge_qa_score,
     log_query_result,
     parse_args,
     ranked_sessions_from_traces,
@@ -133,6 +134,42 @@ class RealMemTopSessionEvalTest(unittest.TestCase):
         self.assertFalse(should_save_record_state(9, 10))
         self.assertTrue(should_save_record_state(10, 10))
         self.assertFalse(should_save_record_state(10, 0))
+
+    def test_qa_judge_retries_json_decode_error_and_logs_raw_response(self) -> None:
+        class FlakyJudgeClient:
+            json_max_attempts = 2
+            json_retry_delay = 0.0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, *_args, **_kwargs) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"score": 3, "reason": "'
+                return json.dumps({"score": 3, "reason": "complete"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            client = FlakyJudgeClient()
+
+            result = judge_qa_score(
+                client,
+                question="question",
+                gold_memory_text="memory",
+                reference_answer="reference",
+                candidate_answer="candidate",
+                log_store=log_store,
+                query_id="Q-0001",
+            )
+
+            errors = (Path(tmpdir) / "run" / "llm_errors.jsonl").read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result["score"], 3)
+        self.assertEqual(client.calls, 2)
+        payload = json.loads(errors[0])["payload"]
+        self.assertEqual(payload["stage"], "qa_judge")
+        self.assertEqual(payload["query_id"], "Q-0001")
 
 
 if __name__ == "__main__":

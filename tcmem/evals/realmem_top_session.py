@@ -347,6 +347,7 @@ def evaluate_query_top_session(
     client: OpenAICompatibleLLMClient | None = None,
     qa_model_name: str = "",
     with_qa: bool = False,
+    log_store: ModuleLogStore | None = None,
 ) -> dict[str, Any]:
     retrieval = system.retrieve(example.question, top_k=retrieval_record_k)
     traces = dedupe_ranked_traces(traces_from_retrieval(retrieval, system, example.gold_session_uuids))
@@ -397,6 +398,8 @@ def evaluate_query_top_session(
             gold_memory_text=example.gold_memory_text,
             reference_answer=example.reference_answer,
             candidate_answer=generated_answer,
+            log_store=log_store,
+            query_id=example.query_id,
         )
         result["qa_score"] = judge_result["score"]
         result["qa_reason"] = judge_result["reason"]
@@ -431,6 +434,8 @@ def judge_qa_score(
     gold_memory_text: str,
     reference_answer: str,
     candidate_answer: str,
+    log_store: ModuleLogStore | None = None,
+    query_id: str = "",
 ) -> dict[str, Any]:
     prompt = f"""Evaluate the consistency between the candidate answer and the user-related memory.
 
@@ -446,20 +451,95 @@ User-related Memory: {gold_memory_text}
 Reference Answer: {reference_answer}
 Candidate Answer: {candidate_answer}
 """
-    raw = client.generate(
+    parsed = _generate_json_with_retries(
+        client,
         prompt,
         system_prompt="realmem_qa_judge",
         temperature=0.0,
         max_tokens=1200,
-        response_format={"type": "json_object"},
+        stage="qa_judge",
+        log_store=log_store,
+        context={"query_id": query_id},
     )
-    parsed = _extract_json_payload(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("QA judge returned non-object JSON")
     score = int(parsed.get("score", -1))
     if score not in {0, 1, 2, 3}:
         raise ValueError(f"QA judge score must be 0, 1, 2, or 3; got {score!r}")
     return {"score": score, "reason": str(parsed.get("reason", "") or "")}
+
+
+def _generate_json_with_retries(
+    client: OpenAICompatibleLLMClient,
+    prompt: str,
+    *,
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    stage: str,
+    log_store: ModuleLogStore | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any] | list[Any]:
+    max_attempts = max(1, int(getattr(client, "json_max_attempts", 3) or 3))
+    retry_delay = max(0.0, float(getattr(client, "json_retry_delay", 0.5) or 0.0))
+    last_error: json.JSONDecodeError | None = None
+    for attempt in range(1, max_attempts + 1):
+        raw = client.generate(
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        response_text = str(raw or "")
+        try:
+            return _extract_json_payload(response_text)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            _log_llm_json_error(
+                log_store=log_store,
+                stage=stage,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                response_text=response_text,
+                error=exc,
+                prompt=prompt,
+                context=context,
+            )
+            if attempt >= max_attempts:
+                raise
+            if retry_delay > 0.0:
+                time.sleep(retry_delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"LLM returned invalid JSON for stage {stage}")
+
+
+def _log_llm_json_error(
+    *,
+    log_store: ModuleLogStore | None,
+    stage: str,
+    attempt: int,
+    max_attempts: int,
+    response_text: str,
+    error: json.JSONDecodeError,
+    prompt: str,
+    context: dict[str, Any] | None = None,
+) -> None:
+    if log_store is None:
+        return
+    log_store.log(
+        "llm_errors",
+        "json_decode_failed",
+        stage=stage,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        error_type=type(error).__name__,
+        message=str(error),
+        prompt_chars=len(prompt),
+        raw_response_excerpt=response_text[:1200],
+        **(context or {}),
+    )
 
 
 def summarize_metrics(detailed_results: list[dict[str, Any]], ks: list[int]) -> dict[str, Any]:
@@ -607,6 +687,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     client=client,
                     qa_model_name=runtime.model,
                     with_qa=args.with_qa,
+                    log_store=log_store,
                 )
                 detailed_results.append(result)
                 retrieval_results[example.query_id] = result["retrieval_result"]
@@ -893,7 +974,9 @@ def _extract_json_payload(text: str) -> dict[str, Any] | list[Any]:
         stripped = re.sub(r"```$", "", stripped).strip()
     try:
         return json.loads(stripped)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if stripped.startswith(("{", "[")):
+            raise exc
         match = re.search(r"(\{.*\}|\[.*\])", stripped, flags=re.S)
         if not match:
             raise
