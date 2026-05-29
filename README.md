@@ -223,10 +223,19 @@ path_a_chain_weight    = 0.1
 
 ### Step 3: Path B, Vector + Graph Retrieval
 
-Path B first retrieves semantic seed records from the vector index:
+Path B first retrieves both vector seeds and BM25 seeds:
 
 ```text
-graph_seed_limit = 12
+graph_seed_limit      = 12
+graph_bm25_seed_limit = 12
+```
+
+If the same record appears in both seed sets, its seed strength is blended as:
+
+```text
+seed_score =
+  graph_vector_seed_weight * semantic_seed_score
++ graph_bm25_seed_weight   * bm25_seed_score
 ```
 
 Then it walks the dialogue graph:
@@ -241,22 +250,26 @@ Each graph-expanded record receives:
 graph_score = seed_score / (depth + 1)
 ```
 
-Then Path B combines semantic and graph scores:
+Then Path B combines semantic, BM25, and graph scores:
 
 ```text
 base_score =
   path_b_semantic_weight * semantic_score
++ path_b_bm25_weight     * bm25_score
 + path_b_graph_weight    * graph_score
 ```
 
 Default weights:
 
 ```text
-path_b_semantic_weight = 0.45
-path_b_graph_weight    = 0.55
+path_b_semantic_weight   = 0.45
+path_b_bm25_weight       = 0.2
+path_b_graph_weight      = 0.55
+graph_vector_seed_weight = 0.7
+graph_bm25_seed_weight   = 0.3
 ```
 
-Task-chain context can apply status/route penalties or boosts.
+Task-chain context still applies status/route penalties after this base score.
 
 ### Step 4: Path Fusion
 
@@ -327,7 +340,11 @@ Important `TCMemConfig` fields:
 | `path_a_weight` | `0.6` | Final fusion weight for task-chain path |
 | `path_b_weight` | `0.4` | Final fusion weight for vector/graph path |
 | `graph_seed_limit` | `12` | Number of vector seeds for graph expansion |
+| `graph_bm25_seed_limit` | `12` | Number of BM25 seeds for graph expansion |
+| `graph_vector_seed_weight` | `0.7` | Weight of vector seed score in blended graph seed strength |
+| `graph_bm25_seed_weight` | `0.3` | Weight of BM25 seed score in blended graph seed strength |
 | `graph_walk_depth` | `2` | Max graph expansion depth |
+| `path_b_bm25_weight` | `0.2` | BM25 contribution in Path B record ranking |
 | `routed_task_score` | `1.0` | Route score for records in routed tasks |
 | `unrouted_task_score` | `0.3` | Route score for records outside routed tasks |
 | `task_metadata_refresh_interval` | `5` | Refresh task metadata every N records per task; `0` disables |
