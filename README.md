@@ -28,9 +28,9 @@ pip install -e .[dev]
 ```
 
 For this machine, CUDA 12.8 is available, so the environment file installs
-`torch==2.5.1+cu121` from the PyTorch CUDA 12.1 wheel index. That is compatible
-with the current driver and keeps embedding inference on GPU when
-`embedding_device="auto"`.
+`torch==2.6.0+cu124` from the PyTorch CUDA 12.4 wheel index. That is compatible
+with the current driver and can load the local BGE-M3 `.bin` checkpoint while
+keeping embedding inference on GPU when `embedding_device="auto"`.
 
 ## Smoke Test
 
@@ -49,12 +49,15 @@ conda run -n tcmem python -m tcmem.evals.realmem_top_session \
   --run-name tcmem_realmem_adeleke_top_session \
   --output-dir result/results/tcmem_realmem_adeleke_top_session \
   --log-dir result/logs \
+  --embedding-model /data/wz/models/bgem3 \
   --retrieval-record-k 200 \
   --session-ks 5,10,20 \
   --verbose
 ```
 
 Add `--with-qa` to generate answers from the top sessions and judge QA.
+During evaluation, `dataset.jsonl` records dataset-level events only. Use
+`progress.jsonl` for live progress across sessions, records, and queries.
 
 ## Minimal Usage
 

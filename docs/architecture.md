@@ -47,13 +47,13 @@ conda activate tcmem
 
 验证结果：
 
-- `torch 2.5.1+cu121`
+- `torch 2.6.0+cu124`
 - `cuda_available=True`
 - `device_count=8`
 - `chromadb 1.5.9`
 - `faiss 1.14.2`
 - `sentence_transformers 5.5.1`
-- `transformers 4.57.6`
+- `transformers 4.56.2`
 
 测试命令：
 

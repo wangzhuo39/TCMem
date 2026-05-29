@@ -186,6 +186,40 @@ def build_pair_records(dataset: dict[str, Any], examples: list[QueryExample]) ->
     return pair_records
 
 
+def build_progress_payload(
+    *,
+    pair: PairRecord,
+    processed_records: int,
+    total_records: int,
+    evaluated_queries: int,
+    total_queries: int,
+    elapsed_seconds: float,
+    query_id: str | None = None,
+) -> dict[str, Any]:
+    def ratio(done: int, total: int) -> float:
+        return round(done / total, 4) if total > 0 else 0.0
+
+    payload: dict[str, Any] = {
+        "processed_records": processed_records,
+        "total_records": total_records,
+        "record_progress": ratio(processed_records, total_records),
+        "evaluated_queries": evaluated_queries,
+        "total_queries": total_queries,
+        "query_progress": ratio(evaluated_queries, total_queries),
+        "session_number": pair.session_index + 1,
+        "session_uuid": pair.record.session_uuid,
+        "session_identifier": pair.record.session_identifier,
+        "record_number_in_session": pair.record_index + 1,
+        "record_id": pair.record.record_id,
+        "user_turn_index": pair.user_turn_index,
+        "assistant_turn_index": pair.assistant_turn_index,
+        "elapsed_seconds": round(elapsed_seconds, 2),
+    }
+    if query_id:
+        payload["query_id"] = query_id
+    return payload
+
+
 def build_session_text_by_uuid(dataset: dict[str, Any]) -> dict[str, str]:
     session_text_by_uuid: dict[str, str] = {}
     for dialogue in dataset.get("dialogues", []) or []:
@@ -506,9 +540,50 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     evaluated = 0
     failed = 0
     started_at = time.time()
+    processed_records = 0
+    current_session_uuid = ""
+    log_store.log(
+        "progress",
+        "run_started",
+        processed_records=processed_records,
+        total_records=len(pair_records),
+        record_progress=0.0,
+        evaluated_queries=evaluated,
+        total_queries=len(examples),
+        query_progress=0.0,
+        elapsed_seconds=0.0,
+    )
     for index, pair in enumerate(pair_records, start=1):
+        if pair.record.session_uuid != current_session_uuid:
+            current_session_uuid = pair.record.session_uuid
+            log_store.log(
+                "progress",
+                "session_started",
+                **build_progress_payload(
+                    pair=pair,
+                    processed_records=processed_records,
+                    total_records=len(pair_records),
+                    evaluated_queries=evaluated,
+                    total_queries=len(examples),
+                    elapsed_seconds=time.time() - started_at,
+                ),
+            )
+
         example = pair.query_example
         if example is not None and example.query_id in example_ids:
+            log_store.log(
+                "progress",
+                "query_started",
+                **build_progress_payload(
+                    pair=pair,
+                    processed_records=processed_records,
+                    total_records=len(pair_records),
+                    evaluated_queries=evaluated,
+                    total_queries=len(examples),
+                    elapsed_seconds=time.time() - started_at,
+                    query_id=example.query_id,
+                ),
+            )
             try:
                 result = evaluate_query_top_session(
                     system=system,
@@ -528,12 +603,40 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 evaluated += 1
                 summary_so_far = summarize_metrics(detailed_results, session_ks)
                 log_store.log("metrics", "cumulative_metrics", query_id=example.query_id, **summary_so_far)
+                log_store.log(
+                    "progress",
+                    "query_evaluated",
+                    **build_progress_payload(
+                        pair=pair,
+                        processed_records=processed_records,
+                        total_records=len(pair_records),
+                        evaluated_queries=evaluated,
+                        total_queries=len(examples),
+                        elapsed_seconds=time.time() - started_at,
+                        query_id=example.query_id,
+                    ),
+                )
                 if args.verbose:
                     elapsed = time.time() - started_at
                     print(f"[query] {evaluated}/{len(examples)} {example.query_id} recall_all@{max(session_ks)}={result['retrieval_metrics'][f'recall_all@{max(session_ks)}']:.1f} elapsed={elapsed:.1f}s", flush=True)
             except Exception as exc:
                 failed += 1
                 log_store.log("errors", "query_failed", query_id=example.query_id, error_type=type(exc).__name__, message=str(exc))
+                log_store.log(
+                    "progress",
+                    "query_failed",
+                    **build_progress_payload(
+                        pair=pair,
+                        processed_records=processed_records,
+                        total_records=len(pair_records),
+                        evaluated_queries=evaluated,
+                        total_queries=len(examples),
+                        elapsed_seconds=time.time() - started_at,
+                        query_id=example.query_id,
+                    ),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
                 detailed_results.append(
                     {
                         "query_id": example.query_id,
@@ -557,6 +660,19 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         if args.max_queries is not None and evaluated >= args.max_queries:
             break
         system.ingest_record(pair.record)
+        processed_records = index
+        log_store.log(
+            "progress",
+            "record_ingested",
+            **build_progress_payload(
+                pair=pair,
+                processed_records=processed_records,
+                total_records=len(pair_records),
+                evaluated_queries=evaluated,
+                total_queries=len(examples),
+                elapsed_seconds=time.time() - started_at,
+            ),
+        )
         if args.verbose and index % 50 == 0:
             print(f"[ingest] records={index}/{len(pair_records)} queries={evaluated}/{len(examples)}", flush=True)
 
@@ -589,6 +705,18 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     manifest["artifacts"] = {key: str(path) for key, path in paths.items()}
     dump_json(paths["manifest"], manifest)
     log_store.log("dataset", "run_finished", output_dir=str(output_dir), evaluated_queries=evaluated, failed_queries=failed)
+    log_store.log(
+        "progress",
+        "run_finished",
+        processed_records=processed_records,
+        total_records=len(pair_records),
+        record_progress=round(processed_records / len(pair_records), 4) if pair_records else 0.0,
+        evaluated_queries=evaluated,
+        total_queries=len(examples),
+        query_progress=round(evaluated / len(examples), 4) if examples else 0.0,
+        failed_queries=failed,
+        elapsed_seconds=round(time.time() - started_at, 2),
+    )
     return {"manifest": manifest, "summary": metrics_summary}
 
 

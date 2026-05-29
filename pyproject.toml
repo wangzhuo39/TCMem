@@ -16,8 +16,8 @@ dependencies = [
   "openai>=1.0",
   "socksio>=1.0.0",
   "sentence-transformers>=2.7",
-  "transformers>=4.40,<5.0",
-  "torch==2.5.1",
+  "transformers>=4.40,<4.57",
+  "torch==2.6.0",
   "chromadb>=0.5",
   "faiss-cpu>=1.7",
 ]
