@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcmem"
+version = "0.1.0"
+description = "Task-chain memory system with persistent vector retrieval."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pydantic>=2.0",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "rank-bm25>=0.2.2",
+  "openai>=1.0",
+  "sentence-transformers>=2.7",
+  "transformers>=4.40,<5.0",
+  "torch==2.5.1",
+  "chromadb>=0.5",
+  "faiss-cpu>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tcmem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
