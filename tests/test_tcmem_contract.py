@@ -338,6 +338,25 @@ custom_stage:
         self.assertEqual([hit.item_id for hit in hits], ["rec_alpha", "rec_beta"])
         self.assertEqual(hits[0].metadata["session_uuid"], "alpha_session")
 
+    def test_in_memory_bm25_index_ranks_keyword_hits_and_normalizes_scores(self) -> None:
+        from tcmem.infrastructure.indices import InMemoryBM25Index
+
+        index = InMemoryBM25Index()
+        index.sync_items(
+            [
+                VectorIndexItem("rec_low", "zanzibar archive"),
+                VectorIndexItem("rec_high", "ledger ledger zanzibar ledger archive"),
+                VectorIndexItem("rec_none", "alpha generic project note"),
+            ]
+        )
+
+        hits = index.search("zanzibar ledger", top_k=3)
+
+        self.assertEqual([hit.item_id for hit in hits[:2]], ["rec_high", "rec_low"])
+        self.assertGreater(hits[0].score, hits[1].score)
+        self.assertLessEqual(hits[0].score, 1.0)
+        self.assertGreaterEqual(hits[1].score, 0.0)
+
     def test_memory_system_retrieves_through_persistent_vector_index_and_task_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             system = MemorySystem(

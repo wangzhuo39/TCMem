@@ -9,6 +9,50 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    class BM25Okapi:  # pragma: no cover - exercised indirectly in environments without rank_bm25.
+        def __init__(self, corpus: list[list[str]], *, k1: float = 1.5, b: float = 0.75) -> None:
+            self.corpus = corpus
+            self.k1 = k1
+            self.b = b
+            self.doc_count = len(corpus)
+            self.doc_lengths = np.asarray([len(document) for document in corpus], dtype="float32")
+            self.average_doc_length = float(np.mean(self.doc_lengths)) if self.doc_count else 0.0
+            self.term_frequencies: list[dict[str, int]] = []
+            document_frequency: dict[str, int] = {}
+            for document in corpus:
+                frequencies: dict[str, int] = {}
+                for token in document:
+                    frequencies[token] = frequencies.get(token, 0) + 1
+                self.term_frequencies.append(frequencies)
+                for token in frequencies:
+                    document_frequency[token] = document_frequency.get(token, 0) + 1
+            self.idf = {
+                token: float(np.log(1.0 + (self.doc_count - freq + 0.5) / (freq + 0.5)))
+                for token, freq in document_frequency.items()
+            }
+
+        def get_scores(self, query_tokens: list[str]) -> np.ndarray:
+            if self.doc_count == 0:
+                return np.zeros((0,), dtype="float32")
+            scores = np.zeros((self.doc_count,), dtype="float32")
+            if not query_tokens:
+                return scores
+            for index, frequencies in enumerate(self.term_frequencies):
+                doc_length = float(self.doc_lengths[index]) if index < len(self.doc_lengths) else 0.0
+                norm = self.k1 * (1.0 - self.b + self.b * doc_length / self.average_doc_length) if self.average_doc_length > 0.0 else self.k1
+                score = 0.0
+                for token in query_tokens:
+                    frequency = frequencies.get(token, 0)
+                    if frequency <= 0:
+                        continue
+                    numerator = frequency * (self.k1 + 1.0)
+                    denominator = frequency + norm
+                    score += self.idf.get(token, 0.0) * numerator / denominator if denominator > 0.0 else 0.0
+                scores[index] = score
+            return scores
 
 from ..config import TCMemConfig
 from ..utils.embedding_client import SemanticScorer
@@ -23,6 +67,14 @@ class VectorIndexItem:
 
 @dataclass(slots=True)
 class VectorIndexHit:
+    item_id: str
+    score: float
+    text: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class BM25IndexHit:
     item_id: str
     score: float
     text: str = ""
@@ -301,6 +353,57 @@ class ChromaVectorIndex(VectorIndex):
         return self._collection
 
 
+class InMemoryBM25Index:
+    def __init__(self) -> None:
+        self._items: list[VectorIndexItem] = []
+        self._tokenized_corpus: list[list[str]] = []
+        self._bm25: BM25Okapi | None = None
+
+    def sync_items(self, items: list[VectorIndexItem]) -> None:
+        self._items = [
+            VectorIndexItem(
+                item_id=str(item.item_id),
+                text=str(item.text or ""),
+                metadata=dict(item.metadata or {}),
+            )
+            for item in items
+        ]
+        self._tokenized_corpus = [_tokenize_lexical_text(item.text) for item in self._items]
+        self._bm25 = BM25Okapi(self._tokenized_corpus) if self._items else None
+
+    def search(self, query: str, *, top_k: int) -> list[BM25IndexHit]:
+        if top_k <= 0 or self._bm25 is None or not self._items:
+            return []
+        query_tokens = _tokenize_lexical_text(query)
+        if not query_tokens:
+            return []
+        raw_scores = np.asarray(self._bm25.get_scores(query_tokens), dtype="float32")
+        positive_mask = raw_scores > 0.0
+        if not np.any(positive_mask):
+            return []
+        positive_indices = np.flatnonzero(positive_mask)
+        normalized_scores = _normalize_scores(raw_scores[positive_mask])
+        order = np.argsort(-normalized_scores, kind="mergesort")[: min(top_k, len(positive_indices))]
+        hits: list[BM25IndexHit] = []
+        for ranked_index in order:
+            item_index = int(positive_indices[int(ranked_index)])
+            item = self._items[item_index]
+            hits.append(
+                BM25IndexHit(
+                    item_id=item.item_id,
+                    score=round(float(normalized_scores[int(ranked_index)]), 6),
+                    text=item.text,
+                    metadata=dict(item.metadata),
+                )
+            )
+        return hits
+
+    def clear(self) -> None:
+        self._items = []
+        self._tokenized_corpus = []
+        self._bm25 = None
+
+
 def build_vector_index(config: TCMemConfig, *, owner_id: str, index_name: str) -> VectorIndex:
     backend = config.vector_index_backend.lower()
     if backend == "numpy":
@@ -339,6 +442,23 @@ def _cosine_scores(query_vector: np.ndarray, embeddings: np.ndarray) -> np.ndarr
     denominator = embedding_norms * query_norm
     raw = embeddings @ query_vector
     return np.divide(raw, denominator, out=np.zeros_like(raw, dtype="float32"), where=denominator > 0)
+
+
+def _tokenize_lexical_text(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+
+
+def _normalize_scores(scores: np.ndarray) -> np.ndarray:
+    if scores.size == 0:
+        return np.zeros((0,), dtype="float32")
+    minimum = float(np.min(scores))
+    maximum = float(np.max(scores))
+    if maximum <= minimum:
+        if maximum <= 0.0:
+            return np.zeros(scores.shape, dtype="float32")
+        return np.ones(scores.shape, dtype="float32")
+    normalized = (scores - minimum) / (maximum - minimum)
+    return np.clip(normalized.astype("float32"), 0.0, 1.0)
 
 
 def _chroma_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
