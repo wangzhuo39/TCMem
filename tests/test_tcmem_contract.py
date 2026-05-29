@@ -52,6 +52,16 @@ class FakeEmbeddingClient:
         return float(np.dot(left, right) / denominator) if denominator > 0.0 else 0.0
 
 
+class KeywordRescueEmbeddingClient(FakeEmbeddingClient):
+    def _vector(self, text: str) -> np.ndarray:
+        lowered = text.lower()
+        if "alpha" in lowered or "question" in lowered:
+            return np.array([1.0, 0.0], dtype="float32")
+        if "zanzibar" in lowered or "ledger" in lowered:
+            return np.array([0.0, 1.0], dtype="float32")
+        return np.array([0.5, 0.5], dtype="float32")
+
+
 class FakeLLMClient:
     def generate(self, prompt: str, **_kwargs) -> str:
         payload = _prompt_payload(prompt)
@@ -356,19 +366,21 @@ custom_stage:
             config.path_b_bm25_weight = 1.0
             system = MemorySystem(
                 config=config,
-                embedding_client=FakeEmbeddingClient(),
+                embedding_client=KeywordRescueEmbeddingClient(),
                 llm_client=FakeLLMClient(),
             )
-            system.ingest_record(self._record("rec_alpha", "alpha generic project note"))
-            system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail"))
+            system.ingest_record(self._record("rec_alpha", "alpha question bridge note"))
+            system.ingest_record(self._record("rec_kw", "zanzibar ledger compliance detail", entities=["alpha"]))
 
-            result = system.retrieve("zanzibar ledger", top_k=5)
+            result = system.retrieve("alpha question", top_k=5)
 
         record_ids = [hit.source_record_id for hit in result.hits]
         self.assertIn("rec_kw", record_ids)
         keyword_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_kw")
+        alpha_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_alpha")
         self.assertIn("path_b_vector_bm25_graph", keyword_hit.reason)
         self.assertGreater(keyword_hit.bm25_score, 0.0)
+        self.assertEqual(alpha_hit.bm25_score, 0.0)
 
     def test_path_b_ranking_uses_explicit_bm25_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -385,13 +397,16 @@ custom_stage:
                 embedding_client=FakeEmbeddingClient(),
                 llm_client=FakeLLMClient(),
             )
-            system.ingest_record(self._record("rec_high", "ledger ledger zanzibar ledger archive"))
             system.ingest_record(self._record("rec_low", "zanzibar archive"))
+            system.ingest_record(self._record("rec_high", "ledger ledger zanzibar ledger archive"))
 
             result = system.retrieve("zanzibar ledger", top_k=2)
 
         self.assertEqual([hit.source_record_id for hit in result.hits], ["rec_high", "rec_low"])
+        self.assertGreater(result.hits[0].score, result.hits[1].score)
         self.assertGreater(result.hits[0].bm25_score, result.hits[1].bm25_score)
+        self.assertEqual(result.hits[0].score, result.hits[0].bm25_score)
+        self.assertEqual(result.hits[1].score, result.hits[1].bm25_score)
 
     def test_path_b_graph_neighbor_without_lexical_match_keeps_zero_bm25_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
