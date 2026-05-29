@@ -326,7 +326,8 @@ class InMemoryBM25Index:
             for item in items
         ]
         self._tokenized_corpus = [_tokenize_lexical_text(item.text) for item in self._items]
-        self._bm25 = BM25Okapi(self._tokenized_corpus) if self._items else None
+        non_empty_documents = [tokens for tokens in self._tokenized_corpus if tokens]
+        self._bm25 = BM25Okapi(self._tokenized_corpus) if self._items and len(non_empty_documents) == len(self._tokenized_corpus) else None
 
     def search(self, query: str, *, top_k: int) -> list[BM25IndexHit]:
         if top_k <= 0 or self._bm25 is None or not self._items:

@@ -342,6 +342,8 @@ custom_stage:
         from tcmem.infrastructure.indices import InMemoryBM25Index
 
         index = InMemoryBM25Index()
+        self.assertEqual(index.search("zanzibar ledger", top_k=3), [])
+
         index.sync_items(
             [
                 VectorIndexItem("rec_low", "zanzibar archive"),
@@ -350,9 +352,10 @@ custom_stage:
             ]
         )
 
+        self.assertEqual(index.search("", top_k=3), [])
         hits = index.search("zanzibar ledger", top_k=3)
 
-        self.assertEqual([hit.item_id for hit in hits[:2]], ["rec_high", "rec_low"])
+        self.assertEqual([hit.item_id for hit in hits], ["rec_high", "rec_low"])
         self.assertGreater(hits[0].score, hits[1].score)
         self.assertEqual(hits[0].score, 1.0)
         self.assertTrue(all(0.0 <= hit.score <= 1.0 for hit in hits))
