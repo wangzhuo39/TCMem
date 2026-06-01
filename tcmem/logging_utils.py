@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -21,6 +22,12 @@ class ModuleLogStore:
     def path_for(self, module: str) -> Path:
         return self.run_dir / f"{module}.jsonl"
 
+    def task_chain_path_for(self, task_id: str) -> Path:
+        safe_task_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(task_id)).strip("._-")
+        if not safe_task_id:
+            safe_task_id = "task"
+        return self.run_dir / "task_chains" / f"{safe_task_id}.jsonl"
+
     def log(self, module: str, event: str, **payload: Any) -> None:
         entry = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -30,5 +37,18 @@ class ModuleLogStore:
         }
         target = self.path_for(module)
         with self._lock:
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def log_task_chain(self, chain_id: str, event: str, **payload: Any) -> None:
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "module": "task_chain",
+            "event": event,
+            "payload": to_primitive(payload),
+        }
+        target = self.task_chain_path_for(chain_id)
+        with self._lock:
+            target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(entry, ensure_ascii=False) + "\n")

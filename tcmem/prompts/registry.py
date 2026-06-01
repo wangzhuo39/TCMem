@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -11,7 +12,11 @@ import yaml
 DEFAULT_PROMPT_RESOURCE = "default_prompts.yaml"
 TEXT_PROMPT_RESOURCES = {
     "entity_extraction": "entity_extraction.txt",
+    "record_intent_understanding": "record_intent_understanding.txt",
+    "query_intent_understanding": "query_intent_understanding.txt",
     "task_routing": "task_routing.txt",
+    "task_routing_review": "task_routing_review.txt",
+    "record_conflict_resolution": "record_conflict_resolution.txt",
     "query_routing": "query_routing.txt",
     "task_metadata_refresh": "task_metadata_refresh.txt",
 }
@@ -41,7 +46,7 @@ class PromptRegistry:
         for prompt_name, resource_name in TEXT_PROMPT_RESOURCES.items():
             candidate = package_files.joinpath(resource_name)
             if candidate.is_file():
-                prompts[prompt_name] = PromptTemplate(system="", user=candidate.read_text(encoding="utf-8").rstrip())
+                prompts[prompt_name] = _template_from_txt(candidate.read_text(encoding="utf-8"))
         return cls(prompts)
 
     @classmethod
@@ -61,12 +66,12 @@ class PromptRegistry:
             for prompt_name, file_name in TEXT_PROMPT_RESOURCES.items():
                 txt_path = prompt_path / file_name
                 if txt_path.exists():
-                    prompts[prompt_name] = PromptTemplate(system="", user=txt_path.read_text(encoding="utf-8").rstrip())
+                    prompts[prompt_name] = _template_from_txt(txt_path.read_text(encoding="utf-8"))
             return cls(prompts)
         if prompt_path.suffix.lower() in {".yaml", ".yml"}:
             return cls.from_yaml_text(prompt_path.read_text(encoding="utf-8"))
         if prompt_path.suffix.lower() == ".txt":
-            return cls.from_mapping({prompt_path.stem: {"system": "", "user": prompt_path.read_text(encoding="utf-8")}})
+            return cls({prompt_path.stem: _template_from_txt(prompt_path.read_text(encoding="utf-8"))})
         raise ValueError(f"unsupported prompt file type: {prompt_path}")
 
     @classmethod
@@ -99,3 +104,11 @@ class PromptRegistry:
         for key, value in values.items():
             user_prompt = user_prompt.replace("{{" + key + "}}", str(value))
         return RenderedPrompt(system_prompt=template.system, user_prompt=user_prompt)
+
+
+def _template_from_txt(text: str) -> PromptTemplate:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    match = re.match(r"\s*---\s*system\s*---\s*(.*?)^\s*---\s*user\s*---\s*(.*)\Z", normalized, flags=re.S | re.I | re.M)
+    if match:
+        return PromptTemplate(system=match.group(1).strip(), user=match.group(2).rstrip())
+    return PromptTemplate(system="", user=normalized.rstrip())

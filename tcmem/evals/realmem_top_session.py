@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -28,6 +29,12 @@ class RuntimeConfig:
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-v4-flash"
     timeout: int = 120
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationOptions:
+    mode: str = "tcmem_top_session"
+    task_chain_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -68,6 +75,40 @@ def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         base_url=args.base_url or data.get("base_url") or "https://api.deepseek.com",
         model=args.model or data.get("model") or "deepseek-v4-flash",
         timeout=args.timeout or int(data.get("timeout", 120) or 120),
+    )
+
+
+def evaluation_options_from_args(_args: argparse.Namespace) -> EvaluationOptions:
+    return EvaluationOptions()
+
+
+def build_tcmem_config(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    log_store_base_dir: str | Path,
+    runtime: RuntimeConfig,
+    task_chain_enabled: bool,
+) -> TCMemConfig:
+    return TCMemConfig(
+        owner_id=args.owner_id,
+        storage_path=str(output_dir / "state"),
+        log_path=str(log_store_base_dir),
+        embedding_model=args.embedding_model,
+        embedding_device=args.embedding_device,
+        embedding_batch_size=args.embedding_batch_size,
+        vector_index_backend=args.vector_index_backend,
+        vector_index_path=str(output_dir / "vector_index"),
+        graph_seed_limit=args.graph_seed_limit,
+        graph_walk_depth=args.graph_walk_depth,
+        path_a_weight=args.path_a_weight,
+        path_b_weight=args.path_b_weight,
+        llm_api_key=runtime.api_key,
+        llm_base_url=runtime.base_url,
+        llm_model=runtime.model,
+        llm_timeout=runtime.timeout,
+        prompt_path=args.prompt_path,
+        task_chain_enabled=task_chain_enabled,
     )
 
 
@@ -227,6 +268,102 @@ def log_query_result(log_store: ModuleLogStore, event: str, result: dict[str, An
 
 def save_latest_state(system: MemorySystem, output_dir: Path) -> Path:
     return system.save(output_dir / "memory_state_latest.json")
+
+
+def save_query_snapshot(
+    system: MemorySystem,
+    output_dir: Path,
+    query_id: str,
+    *,
+    question: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    slug = _query_snapshot_slug(query_id)
+    snapshot_dir = output_dir / "query_snapshots" / slug
+    memory_state_path = snapshot_dir / "memory_state.json"
+    vector_index_path = snapshot_dir / "vector_index"
+    manifest_path = snapshot_dir / "manifest.json"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    state_path = system.save(memory_state_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_config = dict(state.get("config") or {})
+    source_vector_index_text = str(
+        state_config.get("vector_index_path")
+        or getattr(getattr(system, "config", None), "vector_index_path", "")
+        or ""
+    ).strip()
+    source_vector_index_path = Path(source_vector_index_text) if source_vector_index_text else None
+    if state_config:
+        state_config["storage_path"] = str(snapshot_dir)
+        state_config["vector_index_path"] = str(vector_index_path)
+        state["config"] = state_config
+        dump_json(state_path, state)
+
+    _sync_record_index_if_available(system)
+    vector_index_copied = _copy_vector_index_snapshot(source_vector_index_path, vector_index_path)
+    snapshot = {
+        "schema_version": 1,
+        "query_id": str(query_id),
+        "question": str(question or ""),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "snapshot_dir": str(snapshot_dir),
+        "memory_state_path": str(state_path),
+        "manifest_path": str(manifest_path),
+        "vector_index_path": str(vector_index_path),
+        "vector_index": {
+            "source_path": str(source_vector_index_path) if source_vector_index_path is not None else "",
+            "snapshot_path": str(vector_index_path),
+            "copied": vector_index_copied,
+        },
+        "metadata": metadata or {},
+    }
+    dump_json(manifest_path, snapshot)
+    return snapshot
+
+
+def save_query_state(system: MemorySystem, output_dir: Path, query_id: str) -> Path:
+    snapshot = save_query_snapshot(system, output_dir, query_id)
+    return Path(snapshot["memory_state_path"])
+
+
+def _query_snapshot_slug(query_id: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z._-]+", "_", str(query_id or "").strip()).strip("._-")
+    return slug or "query"
+
+
+def _sync_record_index_if_available(system: MemorySystem) -> None:
+    retrieval = getattr(system, "retrieval", None)
+    sync_record_index = getattr(retrieval, "sync_record_index", None)
+    if callable(sync_record_index):
+        sync_record_index()
+
+
+def _copy_vector_index_snapshot(source_path: Path | None, target_path: Path) -> bool:
+    if source_path is None or not source_path.exists():
+        return False
+    source_resolved = source_path.resolve()
+    target_resolved = target_path.resolve()
+    if source_resolved == target_resolved:
+        return True
+    try:
+        if target_resolved.is_relative_to(source_resolved):
+            return False
+    except AttributeError:
+        if str(target_resolved).startswith(f"{source_resolved}/"):
+            return False
+    if target_path.exists():
+        if target_path.is_dir():
+            shutil.rmtree(target_path)
+        else:
+            target_path.unlink()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.is_dir():
+        shutil.copytree(source_path, target_path)
+    else:
+        target_path.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path / source_path.name)
+    return True
 
 
 def should_save_record_state(processed_records: int, every_records: int) -> bool:
@@ -577,7 +714,8 @@ def default_retrieval_record_k(session_ks: list[int]) -> int:
     return max(200, max_session_k * 10)
 
 
-def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
+def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | None = None) -> dict[str, Any]:
+    options = options or evaluation_options_from_args(args)
     dataset_path = Path(args.dataset)
     dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
     examples = extract_query_examples(dataset)
@@ -598,24 +736,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         model=runtime.model,
         timeout=runtime.timeout,
     )
-    config = TCMemConfig(
-        owner_id=args.owner_id,
-        storage_path=str(output_dir / "state"),
-        log_path=str(log_store.base_dir),
-        embedding_model=args.embedding_model,
-        embedding_device=args.embedding_device,
-        embedding_batch_size=args.embedding_batch_size,
-        vector_index_backend=args.vector_index_backend,
-        vector_index_path=str(output_dir / "vector_index"),
-        graph_seed_limit=args.graph_seed_limit,
-        graph_walk_depth=args.graph_walk_depth,
-        path_a_weight=args.path_a_weight,
-        path_b_weight=args.path_b_weight,
-        llm_api_key=runtime.api_key,
-        llm_base_url=runtime.base_url,
-        llm_model=runtime.model,
-        llm_timeout=runtime.timeout,
-        prompt_path=args.prompt_path,
+    config = build_tcmem_config(
+        args,
+        output_dir=output_dir,
+        log_store_base_dir=log_store.base_dir,
+        runtime=runtime,
+        task_chain_enabled=options.task_chain_enabled,
     )
     system = MemorySystem(config=config, llm_client=client, log_store=log_store)
     if args.max_queries is not None:
@@ -636,7 +762,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_top_k": args.evidence_top_k,
         "with_qa": args.with_qa,
         "max_queries": args.max_queries,
-        "mode": "tcmem_top_session",
+        "mode": options.mode,
         "tcmem_config": config.to_dict(),
     }
     log_store.log("dataset", "dataset_loaded", **dataset_summary)
@@ -692,7 +818,45 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     query_id=example.query_id,
                 ),
             )
+            query_snapshot: dict[str, Any] | None = None
+            query_state_path: Path | None = None
             try:
+                query_snapshot = save_query_snapshot(
+                    system,
+                    output_dir,
+                    example.query_id,
+                    question=example.question,
+                    metadata={
+                        "retrieval_record_k": retrieval_record_k,
+                        "session_ks": session_ks,
+                        "evidence_top_k": args.evidence_top_k,
+                        "with_qa": args.with_qa,
+                        "model": runtime.model,
+                        "base_url": runtime.base_url,
+                        "processed_records": processed_records,
+                        "evaluated_queries": evaluated,
+                        "tcmem_config": config.to_dict(),
+                    },
+                )
+                query_state_path = Path(query_snapshot["memory_state_path"])
+                log_store.log(
+                    "progress",
+                    "query_snapshot_saved",
+                    **build_progress_payload(
+                        pair=pair,
+                        processed_records=processed_records,
+                        total_records=len(pair_records),
+                        evaluated_queries=evaluated,
+                        total_queries=len(examples),
+                        elapsed_seconds=time.time() - started_at,
+                        query_id=example.query_id,
+                    ),
+                    memory_state_path=str(query_state_path),
+                    query_snapshot_dir=str(query_snapshot["snapshot_dir"]),
+                    query_snapshot_manifest_path=str(query_snapshot["manifest_path"]),
+                    vector_index_path=str(query_snapshot["vector_index_path"]),
+                    vector_index_copied=bool(query_snapshot.get("vector_index", {}).get("copied")),
+                )
                 result = evaluate_query_top_session(
                     system=system,
                     example=example,
@@ -706,6 +870,15 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     log_store=log_store,
                     prompt_registry=system.prompt_registry,
                 )
+                result["memory_state_path"] = str(query_state_path)
+                result["query_snapshot_dir"] = str(query_snapshot["snapshot_dir"])
+                result["query_snapshot_manifest_path"] = str(query_snapshot["manifest_path"])
+                result["vector_index_path"] = str(query_snapshot["vector_index_path"])
+                if isinstance(result.get("retrieval_result"), dict):
+                    result["retrieval_result"]["memory_state_path"] = str(query_state_path)
+                    result["retrieval_result"]["query_snapshot_dir"] = str(query_snapshot["snapshot_dir"])
+                    result["retrieval_result"]["query_snapshot_manifest_path"] = str(query_snapshot["manifest_path"])
+                    result["retrieval_result"]["vector_index_path"] = str(query_snapshot["vector_index_path"])
                 detailed_results.append(result)
                 retrieval_results[example.query_id] = result["retrieval_result"]
                 if "generation_result" in result:
@@ -766,6 +939,11 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                 }
+                if query_snapshot is not None and query_state_path is not None:
+                    failure_result["memory_state_path"] = str(query_state_path)
+                    failure_result["query_snapshot_dir"] = str(query_snapshot["snapshot_dir"])
+                    failure_result["query_snapshot_manifest_path"] = str(query_snapshot["manifest_path"])
+                    failure_result["vector_index_path"] = str(query_snapshot["vector_index_path"])
                 detailed_results.append(failure_result)
                 log_query_result(log_store, "query_failed", failure_result)
                 save_latest_state(system, output_dir)

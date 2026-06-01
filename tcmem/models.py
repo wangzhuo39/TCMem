@@ -13,6 +13,23 @@ class ChainNodeStatus(str, Enum):
     DEPRECATED = "deprecated"
 
 
+class TaskStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class IntentUnderstanding:
+    main_intent: str
+    summary: str = ""
+    topic_hint: str = ""
+    key_entities: list[str] = field(default_factory=list)
+    is_substantive: bool = True
+    reason: str = ""
+
+
 @dataclass(slots=True)
 class DialogueTurn:
     speaker: str
@@ -106,6 +123,7 @@ class TaskChain:
     task_id: str
     task_description: str
     owner_id: str
+    status: TaskStatus = TaskStatus.ACTIVE
     created_at: str = ""
     updated_at: str = ""
     entities: list[str] = field(default_factory=list)
@@ -113,6 +131,7 @@ class TaskChain:
     nodes: dict[str, TaskChainNode] = field(default_factory=dict)
     branch_heads: dict[str, str] = field(default_factory=dict)
     next_node_index: int = 1
+    next_branch_index: int = 1
     active_branch_id: str = "main"
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -122,8 +141,43 @@ class RouteDecision:
     linked_task_ids: list[str]
     created_task_ids: list[str]
     routed_task_ids: list[str]
+    main_intent: str
     confidence: float
     reason: str
+    intent: IntentUnderstanding
+
+    def __post_init__(self) -> None:
+        intent = self.intent
+        canonical_main_intent = self.main_intent.strip() or intent.main_intent.strip()
+        self.main_intent = canonical_main_intent
+        self.intent = IntentUnderstanding(
+            summary=intent.summary,
+            main_intent=canonical_main_intent,
+            topic_hint=intent.topic_hint,
+            key_entities=list(intent.key_entities),
+            is_substantive=intent.is_substantive,
+            reason=intent.reason,
+        )
+
+
+@dataclass(slots=True)
+class QueryRouteDecision:
+    query: str
+    routed_task_ids: list[str]
+    query_intent: IntentUnderstanding
+    reason: str
+
+
+@dataclass(slots=True)
+class ChainUpdateResult:
+    task_id: str
+    record_id: str
+    action: str
+    chain_node_id: str | None
+    reference_node_id: str | None = None
+    branch_id: str | None = None
+    status: ChainNodeStatus | None = None
+    reason: str = ""
 
 
 @dataclass(slots=True)
@@ -150,6 +204,8 @@ class RetrievalResult:
     routed_task_ids: list[str]
     hits: list[SearchHit] = field(default_factory=list)
     explanation: str = ""
+    query_intent: IntentUnderstanding | None = None
+    query_route_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -159,3 +215,7 @@ class IngestionResult:
     record_ids: list[str] = field(default_factory=list)
     created_task_ids: list[str] = field(default_factory=list)
     updated_task_ids: list[str] = field(default_factory=list)
+    created_node_ids: list[str] = field(default_factory=list)
+    branched_node_ids: list[str] = field(default_factory=list)
+    overridden_node_ids: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)

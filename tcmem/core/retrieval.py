@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from ..config import TCMemConfig
 from ..infrastructure.indices import InMemoryBM25Index, VectorIndex, VectorIndexItem
-from ..models import ChainNodeStatus, RetrievalResult, SearchHit, TaskChainNode
+from ..models import ChainNodeStatus, IntentUnderstanding, QueryRouteDecision, RetrievalResult, SearchHit, TaskChainNode
 from ..utils.embedding_client import SemanticScorer
 from .graph_store import DialogueGraphStore
 from .task_chain import TaskChainManager
@@ -46,12 +46,26 @@ class RetrievalEngine:
         self.bm25_index = bm25_index or InMemoryBM25Index()
 
     def retrieve(self, query: str, *, top_k: int = 10) -> RetrievalResult:
-        routed_task_ids = self.task_manager.route_for_query(query)
+        if self.config.task_chain_enabled:
+            query_route = self.task_manager.route_for_query(query)
+        else:
+            query_route = QueryRouteDecision(
+                query=query,
+                routed_task_ids=[],
+                query_intent=IntentUnderstanding(
+                    main_intent=query,
+                    is_substantive=True,
+                    reason="task_chain_disabled",
+                ),
+                reason="task_chain_disabled",
+            )
+        routed_task_ids = query_route.routed_task_ids
         routed_task_id_set = set(routed_task_ids)
         aggregates: dict[str, _RecordAggregate] = {}
 
-        for hit in self._path_a(query, routed_task_ids):
-            self._merge_record_hit(aggregates, hit)
+        if self.config.task_chain_enabled:
+            for hit in self._path_a(query, routed_task_ids):
+                self._merge_record_hit(aggregates, hit)
         for hit in self._path_b(query, routed_task_id_set):
             self._merge_record_hit(aggregates, hit)
 
@@ -65,7 +79,9 @@ class RetrievalEngine:
             subqueries=[query],
             routed_task_ids=routed_task_ids,
             hits=ranked,
-            explanation="task_chain_plus_graph_vector_bm25",
+            explanation="task_chain_plus_graph_vector_bm25" if self.config.task_chain_enabled else "graph_vector_bm25_no_task_chain",
+            query_intent=query_route.query_intent,
+            query_route_reason=query_route.reason,
         )
 
     def sync_record_index(self) -> None:
@@ -150,7 +166,7 @@ class RetrievalEngine:
                 + self.config.path_b_bm25_weight * bm25_score
                 + self.config.path_b_graph_weight * graph_score
             )
-            context = self._best_chain_context(record_id, routed_task_ids)
+            context = self._best_chain_context(record_id, routed_task_ids) if self.config.task_chain_enabled else None
             penalty = float(context["penalty"]) if context is not None else 1.0
             hits.append(
                 SearchHit(
@@ -163,7 +179,7 @@ class RetrievalEngine:
                     chain_score=float(context["chain_score"]) if context is not None else 0.0,
                     route_score=float(context["route_score"]) if context is not None else 0.0,
                     depth=best_depth.get(record_id, 0),
-                    reason="path_b_vector_bm25_graph",
+                    reason="path_b_vector_bm25_graph" if self.config.task_chain_enabled else "path_b_vector_bm25_graph_no_task_chain",
                     task_id=str(context["task_id"]) if context is not None and context.get("task_id") else None,
                     source_record_id=record_id,
                     chain_node_id=str(context["node_id"]) if context is not None and context.get("node_id") else None,
@@ -184,7 +200,7 @@ class RetrievalEngine:
         aggregate.route_score = max(aggregate.route_score, hit.route_score)
         if hit.reason == "path_a_chain":
             aggregate.path_a_score = max(aggregate.path_a_score, hit.score)
-        elif hit.reason == "path_b_vector_bm25_graph":
+        elif hit.reason in {"path_b_vector_bm25_graph", "path_b_vector_bm25_graph_no_task_chain"}:
             aggregate.path_b_score = max(aggregate.path_b_score, hit.score)
         if hit.reason and hit.reason not in aggregate.reasons:
             aggregate.reasons.append(hit.reason)
@@ -195,8 +211,15 @@ class RetrievalEngine:
             aggregate.depth = hit.depth
 
     def _finalize_record_hit(self, aggregate: _RecordAggregate) -> SearchHit:
-        score = self.config.path_a_weight * aggregate.path_a_score + self.config.path_b_weight * aggregate.path_b_score
-        ordered_reasons = [reason for reason in ("path_a_chain", "path_b_vector_bm25_graph") if reason in aggregate.reasons]
+        if self.config.task_chain_enabled:
+            score = self.config.path_a_weight * aggregate.path_a_score + self.config.path_b_weight * aggregate.path_b_score
+        else:
+            score = aggregate.path_b_score
+        ordered_reasons = [
+            reason
+            for reason in ("path_a_chain", "path_b_vector_bm25_graph", "path_b_vector_bm25_graph_no_task_chain")
+            if reason in aggregate.reasons
+        ]
         ordered_reasons.extend(reason for reason in aggregate.reasons if reason not in ordered_reasons)
         return SearchHit(
             item_id=aggregate.record_id,

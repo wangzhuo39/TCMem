@@ -16,7 +16,7 @@ quality.
 - **Dialogue graph**: entity co-occurrence graph over records.
 - **Vector index**: persistent record-level semantic index, usually Chroma.
 - **Two-path retrieval**:
-  - Path A: query router -> task chains -> task-chain nodes.
+  - Path A: query intent router -> task chains -> task-chain nodes.
   - Path B: vector retrieval -> graph expansion -> task-chain context scoring.
 - **External prompts**: TCMem core prompts live in editable `.txt` files.
 - **RealMemBench top-session evaluator**: evaluates recall over ranked sessions,
@@ -136,7 +136,13 @@ For each `DialogueRecord`, `MemorySystem.ingest_record()` runs:
    - If it shares entities with previous records, entity co-occurrence edges are
      added.
 
-3. **Record task routing**
+3. **Record intent understanding**
+   - Prompt: `tcmem/prompts/record_intent_understanding.txt`
+   - Output: one intent object used by downstream routing, including
+     `main_intent`, `topic_hint`, `key_entities`, `is_substantive`, and
+     `reason`.
+
+4. **Record task routing**
    - Prompt: `tcmem/prompts/task_routing.txt`
    - Output:
      ```json
@@ -147,27 +153,56 @@ For each `DialogueRecord`, `MemorySystem.ingest_record()` runs:
        "reason": "..."
      }
      ```
+   - Input includes the upstream `record_intent_understanding` result.
+
+5. **Record route review**
+   - Prompt: `tcmem/prompts/task_routing_review.txt`
+   - Reviews the draft route against the upstream intent before any new task is
+     materialized.
    - Every substantive record must connect to at least one task.
    - If the LLM returns an empty route, TCMem retries.
    - If all retries still return no task, ingestion fails loudly.
 
-4. **Task-chain append**
-   - Routed records become task-chain nodes.
-   - Nodes preserve source record ids and chain position.
+6. **Record conflict resolution and task-chain write**
+   - Prompt: `tcmem/prompts/record_conflict_resolution.txt`
+   - Routed records are written with `create`, `override`, `branch`, or
+     `duplicate` actions.
+   - Nodes preserve source record ids, branch ids, status, and chain position.
 
-5. **Task metadata refresh**
+7. **Task metadata refresh**
    - Prompt: `tcmem/prompts/task_metadata_refresh.txt`
    - Controlled by `task_metadata_refresh_interval`.
    - Default: refresh every 5 records per task.
+   - `task_description` and `entities` refresh together.
 
-6. **Vector index sync**
+8. **Vector index sync**
    - `sync_record_index()` persists record vectors for retrieval.
 
 ## Retrieval Flow
 
 `MemorySystem.retrieve(query, top_k)` calls `RetrievalEngine.retrieve()`.
 
-### Step 1: Query Routing
+### Step 1: Query Intent Understanding
+
+Prompt:
+
+```text
+tcmem/prompts/query_intent_understanding.txt
+```
+
+Output:
+
+```json
+{
+  "main_intent": "...",
+  "topic_hint": "...",
+  "key_entities": ["..."],
+  "is_substantive": true,
+  "reason": "..."
+}
+```
+
+### Step 2: Query Routing
 
 Prompt:
 
@@ -180,10 +215,19 @@ Input:
 ```json
 {
   "query": "...",
+  "intent": {
+    "main_intent": "...",
+    "topic_hint": "...",
+    "key_entities": ["..."],
+    "is_substantive": true,
+    "reason": "..."
+  },
+  "candidate_count": 5,
   "task_catalog": [
     {
       "task_id": "...",
       "task_description": "...",
+      "status": "active",
       "entities": ["..."]
     }
   ]
@@ -199,10 +243,10 @@ Output:
 }
 ```
 
-The final `routed_task_ids` are saved in retrieval logs and evaluation outputs.
-The router reason is currently not persisted on successful calls.
+The final `routed_task_ids`, `query_intent`, and `query_route_reason` are saved
+in retrieval logs and evaluation outputs.
 
-### Step 2: Path A, Task-Chain Retrieval
+### Step 3: Path A, Task-Chain Retrieval
 
 Path A starts from routed task ids and scores task-chain nodes:
 
@@ -221,7 +265,7 @@ path_a_status_weight   = 0.2
 path_a_chain_weight    = 0.1
 ```
 
-### Step 3: Path B, Vector + Graph Retrieval
+### Step 4: Path B, Vector + Graph Retrieval
 
 Path B first retrieves both vector seeds and BM25 seeds:
 
@@ -271,7 +315,7 @@ graph_bm25_seed_weight   = 0.3
 
 Task-chain context may apply a status-based penalty after `base_score`, while route context is used only when selecting the best matching chain context.
 
-### Step 4: Path Fusion
+### Step 5: Path Fusion
 
 Path A and Path B are merged by record id:
 
@@ -296,13 +340,17 @@ Core TCMem prompts are plain text files:
 
 ```text
 tcmem/prompts/entity_extraction.txt
+tcmem/prompts/record_intent_understanding.txt
 tcmem/prompts/task_routing.txt
+tcmem/prompts/task_routing_review.txt
+tcmem/prompts/record_conflict_resolution.txt
+tcmem/prompts/query_intent_understanding.txt
 tcmem/prompts/query_routing.txt
 tcmem/prompts/task_metadata_refresh.txt
 ```
 
 These are treated as complete user prompts. The LLM `system_prompt` is empty for
-these four stages. Each file contains `{{payload_json}}`, which is replaced with
+these stages. Each file contains `{{payload_json}}`, which is replaced with
 the stage input.
 
 RealMem evaluation prompts live in:
@@ -445,7 +493,7 @@ Important files:
 | `dataset.jsonl` | Dataset and run configuration events |
 | `progress.jsonl` | Live progress across records, sessions, and queries |
 | `ingestion.jsonl` | Record ingestion events and final task routing ids |
-| `retrieval.jsonl` | Query retrieval events, routed task ids, and hits |
+| `retrieval.jsonl` | Query retrieval events, routed task ids, `query_intent`, `query_route_reason`, and hits |
 | `query_results.jsonl` | Completed/failed query payloads |
 | `metrics.jsonl` | Cumulative metric snapshots |
 | `llm_errors.jsonl` | JSON decode errors, empty routes, invalid payloads |
@@ -472,10 +520,11 @@ Current successful router results are persisted as filtered ids:
 
 - Task router: `ingestion.jsonl` stores `routed_task_ids`.
 - Query router: `retrieval.jsonl`, `query_results.jsonl`, and
-  `retrieval_results.json` store `routed_task_ids`.
+  `retrieval_results.json` store `routed_task_ids`, `query_intent`, and
+  `query_route_reason`.
 
-Successful router `reason` and full raw LLM outputs are not currently persisted.
-They are logged only on error paths.
+Successful router `query_route_reason` is now persisted for retrieval.
+Full raw LLM outputs are still logged only on error paths.
 
 ## Retrieval Path Ablation
 
@@ -508,6 +557,74 @@ failed_query_count
 ```
 
 Then rerun the best 2-3 configurations with `--with-qa`.
+
+## Retrieval Parameter Sweep
+
+After an evaluation has produced `memory_state_latest.json`, run retrieval-only
+sweeps without re-ingesting records:
+
+```bash
+cd /data/wz/agent_memory/iconip2026/TCMem
+
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run --no-capture-output -n tcmem python -m tcmem.evals.realmem_retrieval_sweep \
+  --dataset /data/wz/agent_memory/iconip2026/RealMemBench/dataset/Adeleke_Okonjo_dialogues_256k.json \
+  --state-path /data/wz/agent_memory/iconip2026/result/results/tcmem_realmem_adeleke_full_prompt_txt_20260530/memory_state_latest.json \
+  --config /data/wz/agent_memory/iconip2026/zhuo/runtime_config.json \
+  --session-ks 10,20,30 \
+  --objective recall_all@20 \
+  --retrieval-record-k 300 \
+  --preset small \
+  --output-dir /data/wz/agent_memory/iconip2026/result/sweeps/tcmem_realmem_adeleke_retrieval_sweep_20260530 \
+  --checkpoint-every 1 \
+  --verbose
+```
+
+`conda run` captures `stdout`/`stderr` by default, so live progress can look
+stuck even when the sweep is running. Use `--no-capture-output` (or
+`--live-stream`) if you want to see `[trial-start]`, `[query-start]`, and
+`[query]` lines as they happen.
+
+Useful presets:
+
+| Preset | Trials | Parameters covered |
+|---|---:|---|
+| `small` | 32 | path A/B fusion, graph seed/depth, path B semantic/graph weights |
+| `medium` | 144 | wider graph seed/depth plus path B weights |
+| `large` | 432 | `medium` plus status penalties |
+
+For a focused custom grid:
+
+```bash
+--grid-json '{
+  "path_a_weight": [0.2, 0.4, 0.6],
+  "path_b_weight": [0.8, 0.6, 0.4],
+  "graph_seed_limit": [12, 24, 48],
+  "graph_walk_depth": [2, 3],
+  "path_b_semantic_weight": [0.35, 0.45, 0.55],
+  "path_b_graph_weight": [0.65, 0.55, 0.45],
+  "unrouted_task_score": [0.3, 0.5, 0.7]
+}'
+```
+
+The sweep writes incremental files after each trial:
+
+| File | Meaning |
+|---|---|
+| `sweep_events.jsonl` | Fine-grained run, trial, and per-query progress events |
+| `sweep_progress.jsonl` | One JSON line per completed trial |
+| `sweep_results_partial.json` | Best-so-far and all completed trials |
+| `sweep_results_partial.csv` | Spreadsheet-friendly partial results |
+| `best_retrieval_config_partial.json` | Best-so-far full config |
+| `query_route_cache.json` | Cached query router output |
+
+Final files are `sweep_results.json`, `sweep_results.csv`, and
+`best_retrieval_config.json`.
+
+Watch live progress inside a long trial:
+
+```bash
+tail -f /data/wz/agent_memory/iconip2026/result/sweeps/tcmem_realmem_adeleke_retrieval_sweep_20260530/sweep_events.jsonl
+```
 
 ## Useful Commands
 

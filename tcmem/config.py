@@ -42,6 +42,7 @@ class TCMemConfig:
     task_metadata_refresh_interval: int = 5
     task_router_entity_limit: int = 20
     query_router_candidate_count: int = 5
+    task_chain_enabled: bool = True
     prompt_path: str = ""
 
     active_status_score: float = 1.0

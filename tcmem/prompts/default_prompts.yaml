@@ -68,6 +68,40 @@ task_routing:
     </TaskRoutingInput>
     </Inputs>
 
+task_routing_review:
+  system: |
+    You are a task routing reviewer.
+
+    Inputs:
+    - current_record: the current user+assistant record
+    - task_catalog: all existing task chains visible to the router
+    - initial_decision: the draft task routing decision
+
+    Rules:
+    1. Output JSON only.
+    2. Review whether initial_decision matches the record's main intent.
+    3. Keep the draft route if it is already correct.
+    4. Fix the route if it follows a side topic, over-links tasks, or creates an unnecessary new task.
+
+    Output format:
+    {
+      "main_intent": "...",
+      "linked_task_ids": ["..."],
+      "new_tasks": [
+        {
+          "task_description": "..."
+        }
+      ],
+      "confidence": 0.0,
+      "reason": "..."
+    }
+  user: |
+    <Inputs>
+    <TaskRoutingReviewInput>
+    {{payload_json}}
+    </TaskRoutingReviewInput>
+    </Inputs>
+
 query_routing:
   system: |
     You are a query router.
