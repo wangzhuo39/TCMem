@@ -24,6 +24,9 @@ class _RecordAggregate:
     depth: int | None = None
     task_id: str | None = None
     chain_node_id: str | None = None
+    route_role: str = "unrouted"
+    route_relation: str | None = None
+    route_depth: int = 0
     reasons: list[str] = field(default_factory=list)
 
 
@@ -47,7 +50,20 @@ class RetrievalEngine:
 
     def retrieve(self, query: str, *, top_k: int = 10) -> RetrievalResult:
         if self.config.task_chain_enabled:
-            query_route = self.task_manager.route_for_query(query)
+            try:
+                query_route = self.task_manager.route_for_query(query)
+            except Exception as exc:
+                query_route = QueryRouteDecision(
+                    query=query,
+                    routed_task_ids=[],
+                    query_intent=IntentUnderstanding(
+                        main_intent=query,
+                        summary=query,
+                        is_substantive=True,
+                        reason="query_router_fallback",
+                    ),
+                    reason=f"query_router_fallback:{type(exc).__name__}",
+                )
         else:
             query_route = QueryRouteDecision(
                 query=query,
@@ -59,14 +75,20 @@ class RetrievalEngine:
                 ),
                 reason="task_chain_disabled",
             )
-        routed_task_ids = query_route.routed_task_ids
-        routed_task_id_set = set(routed_task_ids)
+        routed_task_ids = list(query_route.routed_task_ids)
+        expanded_task_ids, expansion_edges = (
+            self.task_manager.expand_task_graph(routed_task_ids)
+            if self.config.task_chain_enabled
+            else ([], [])
+        )
+        primary_task_id_set = set(routed_task_ids)
+        expanded_task_id_set = set(expanded_task_ids)
         aggregates: dict[str, _RecordAggregate] = {}
 
         if self.config.task_chain_enabled:
-            for hit in self._path_a(query, routed_task_ids):
+            for hit in self._path_a(query, expanded_task_ids, primary_task_id_set, expansion_edges):
                 self._merge_record_hit(aggregates, hit)
-        for hit in self._path_b(query, routed_task_id_set):
+        for hit in self._path_b(query, primary_task_id_set, expanded_task_id_set, expansion_edges):
             self._merge_record_hit(aggregates, hit)
 
         ranked = sorted(
@@ -82,6 +104,8 @@ class RetrievalEngine:
             explanation="task_chain_plus_graph_vector_bm25" if self.config.task_chain_enabled else "graph_vector_bm25_no_task_chain",
             query_intent=query_route.query_intent,
             query_route_reason=query_route.reason,
+            expanded_task_ids=expanded_task_ids,
+            expansion_edges=expansion_edges,
         )
 
     def sync_record_index(self) -> None:
@@ -105,12 +129,24 @@ class RetrievalEngine:
         )
         self.bm25_index.sync_items(items)
 
-    def _path_a(self, query: str, routed_task_ids: list[str]) -> list[SearchHit]:
+    def _path_a(
+        self,
+        query: str,
+        expanded_task_ids: list[str],
+        primary_task_ids: set[str],
+        expansion_edges: list[dict[str, Any]],
+    ) -> list[SearchHit]:
         hits: list[SearchHit] = []
-        for task_id in routed_task_ids:
+        for task_id in expanded_task_ids:
             task = self.task_manager.get_task(task_id)
             if task is None:
                 continue
+            route_role, route_score, route_relation, route_depth = self._route_metadata(
+                task_id,
+                primary_task_ids,
+                set(expanded_task_ids),
+                expansion_edges,
+            )
             max_pos = max(1, len(task.nodes))
             for node in sorted(task.nodes.values(), key=lambda item: item.position, reverse=True):
                 node_text = "\n".join(part for part in [node.summary, node.user_content, node.assistant_content or ""] if part)
@@ -134,11 +170,20 @@ class RetrievalEngine:
                         task_id=task_id,
                         source_record_id=node.source_record_id,
                         chain_node_id=node.node_id,
+                        route_role=route_role,
+                        route_relation=route_relation,
+                        route_depth=route_depth,
                     )
                 )
         return hits
 
-    def _path_b(self, query: str, routed_task_ids: set[str]) -> list[SearchHit]:
+    def _path_b(
+        self,
+        query: str,
+        primary_task_ids: set[str],
+        expanded_task_ids: set[str],
+        expansion_edges: list[dict[str, Any]],
+    ) -> list[SearchHit]:
         self.sync_record_index()
         vector_seeds = self.record_index.search(query, self.embedding_client, top_k=self.config.graph_seed_limit)
         bm25_seeds = self.bm25_index.search(query, top_k=self.config.graph_bm25_seed_limit)
@@ -166,7 +211,11 @@ class RetrievalEngine:
                 + self.config.path_b_bm25_weight * bm25_score
                 + self.config.path_b_graph_weight * graph_score
             )
-            context = self._best_chain_context(record_id, routed_task_ids) if self.config.task_chain_enabled else None
+            context = (
+                self._best_chain_context(record_id, primary_task_ids, expanded_task_ids, expansion_edges)
+                if self.config.task_chain_enabled
+                else None
+            )
             penalty = float(context["penalty"]) if context is not None else 1.0
             hits.append(
                 SearchHit(
@@ -183,6 +232,9 @@ class RetrievalEngine:
                     task_id=str(context["task_id"]) if context is not None and context.get("task_id") else None,
                     source_record_id=record_id,
                     chain_node_id=str(context["node_id"]) if context is not None and context.get("node_id") else None,
+                    route_role=str(context["route_role"]) if context is not None else "unrouted",
+                    route_relation=str(context["route_relation"]) if context is not None and context.get("route_relation") else None,
+                    route_depth=int(context["route_depth"]) if context is not None else 0,
                 )
             )
         return hits
@@ -197,6 +249,17 @@ class RetrievalEngine:
         aggregate.bm25_score = max(aggregate.bm25_score, hit.bm25_score)
         aggregate.chain_score = max(aggregate.chain_score, hit.chain_score)
         aggregate.graph_score = max(aggregate.graph_score, hit.graph_score)
+        # Keep route metadata from the strongest route evidence.  The previous
+        # implementation updated route_score before comparing, making the
+        # comparison always true and allowing a later weaker Path-B hit to
+        # overwrite the primary/expanded route label.
+        if (
+            hit.route_score > aggregate.route_score
+            or (hit.route_score == aggregate.route_score and hit.score > aggregate.best_overall_score)
+        ):
+            aggregate.route_role = hit.route_role
+            aggregate.route_relation = hit.route_relation
+            aggregate.route_depth = hit.route_depth
         aggregate.route_score = max(aggregate.route_score, hit.route_score)
         if hit.reason == "path_a_chain":
             aggregate.path_a_score = max(aggregate.path_a_score, hit.score)
@@ -235,6 +298,9 @@ class RetrievalEngine:
             task_id=aggregate.task_id,
             source_record_id=aggregate.record_id,
             chain_node_id=aggregate.chain_node_id,
+            route_role=aggregate.route_role,
+            route_relation=aggregate.route_relation,
+            route_depth=aggregate.route_depth,
         )
 
     def _merge_path_b_seeds(self, vector_seeds: list, bm25_seeds: list) -> list[SearchHit]:
@@ -271,7 +337,13 @@ class RetrievalEngine:
             for hit in self.bm25_index.search(query, top_k=len(self.graph.records))
         }
 
-    def _best_chain_context(self, record_id: str, routed_task_ids: set[str]) -> dict[str, float | str] | None:
+    def _best_chain_context(
+        self,
+        record_id: str,
+        primary_task_ids: set[str],
+        expanded_task_ids: set[str],
+        expansion_edges: list[dict[str, Any]],
+    ) -> dict[str, float | str | int] | None:
         best: dict[str, float | str] | None = None
         best_key: tuple[float, float, float, float] | None = None
         for task in self.task_manager.tasks.values():
@@ -281,7 +353,12 @@ class RetrievalEngine:
                     continue
                 status_score = self._status_score(node)
                 chain_score = node.position / max_pos if max_pos else 0.0
-                route_score = self.config.routed_task_score if task.task_id in routed_task_ids else self.config.unrouted_task_score
+                route_role, route_score, route_relation, route_depth = self._route_metadata(
+                    task.task_id,
+                    primary_task_ids,
+                    expanded_task_ids,
+                    expansion_edges,
+                )
                 penalty = self._path_b_penalty(node)
                 key = (penalty, status_score, route_score, chain_score)
                 if best_key is None or key > best_key:
@@ -292,8 +369,42 @@ class RetrievalEngine:
                         "chain_score": chain_score,
                         "route_score": route_score,
                         "penalty": penalty,
+                        "route_role": route_role,
+                        "route_relation": route_relation,
+                        "route_depth": route_depth,
                     }
         return best
+
+    def _route_metadata(
+        self,
+        task_id: str,
+        primary_task_ids: set[str],
+        expanded_task_ids: set[str],
+        expansion_edges: list[dict[str, Any]],
+    ) -> tuple[str, float, str | None, int]:
+        if task_id in primary_task_ids:
+            return "primary", self.config.routed_task_score, None, 0
+        if task_id not in expanded_task_ids:
+            return "unrouted", self.config.unrouted_task_score, None, 0
+        candidates = [edge for edge in expansion_edges if str(edge.get("to", "")) == task_id]
+        relation_scores = {
+            "child": self.config.expanded_child_task_score,
+            "parent": self.config.expanded_parent_task_score,
+            "branch_child": self.config.expanded_branch_child_task_score,
+        }
+        if not candidates:
+            return "expanded", self.config.expanded_branch_child_task_score, None, 0
+        edge = max(
+            candidates,
+            key=lambda item: (
+                relation_scores.get(str(item.get("relation", "")), self.config.expanded_branch_child_task_score),
+                -int(item.get("depth", 0) or 0),
+            ),
+        )
+        relation = str(edge.get("relation", "")) or None
+        score = relation_scores.get(relation or "", self.config.expanded_branch_child_task_score)
+        depth = max(0, int(edge.get("depth", 0) or 0))
+        return "expanded", score, relation, depth
 
     def _status_score(self, node: TaskChainNode) -> float:
         if node.superseded_by:

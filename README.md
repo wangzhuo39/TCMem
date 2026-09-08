@@ -173,7 +173,14 @@ For each `DialogueRecord`, `MemorySystem.ingest_record()` runs:
    - Prompt: `tcmem/prompts/task_metadata_refresh.txt`
    - Controlled by `task_metadata_refresh_interval`.
    - Default: refresh every 5 records per task.
-   - `task_description` and `entities` refresh together.
+   - `task_description`/`canonical_description` is the stable root-task identity.
+   - Ordinary refresh updates `current_focus` and merges new entities; it does
+     not overwrite the root-task identity.
+   - Branches have independent goals, focus, heads, lifecycle state, and
+     branch-local child-task links.
+   - Child tasks link to their parent through `parent_task_id` and
+     `child_task_ids`; when the work belongs to a specific route they also
+     carry `parent_branch_id` and appear in that branch's `child_task_ids`.
 
 8. **Vector index sync**
    - `sync_record_index()` persists record vectors for retrieval.
@@ -226,9 +233,14 @@ Input:
   "task_catalog": [
     {
       "task_id": "...",
-      "task_description": "...",
+      "canonical_description": "...",
+      "current_focus": "...",
       "status": "active",
-      "entities": ["..."]
+      "entities": ["..."],
+      "parent_task_id": null,
+      "parent_branch_id": null,
+      "child_task_ids": [],
+      "branches": []
     }
   ]
 }
@@ -243,12 +255,15 @@ Output:
 }
 ```
 
-The final `routed_task_ids`, `query_intent`, and `query_route_reason` are saved
-in retrieval logs and evaluation outputs.
+The final `routed_task_ids`, deterministic `expanded_task_ids`, `query_intent`,
+and `query_route_reason` are saved in retrieval logs and evaluation outputs.
 
 ### Step 3: Path A, Task-Chain Retrieval
 
-Path A starts from routed task ids and scores task-chain nodes:
+Path A starts from LLM-selected `routed_task_ids`, expands explicit parent,
+child, and branch-local child links into `expanded_task_ids`, then scores the
+corresponding task-chain nodes. The primary route remains separately visible
+for diagnosing whether recall came from the LLM router or hierarchy expansion:
 
 ```text
 path_a_score =
@@ -397,6 +412,9 @@ Important `TCMemConfig` fields:
 | `unrouted_task_score` | `0.3` | Route score for records outside routed tasks |
 | `task_metadata_refresh_interval` | `5` | Refresh task metadata every N records per task; `0` disables |
 | `task_router_entity_limit` | `20` | Max entities shown per task in router inputs |
+| `query_router_candidate_count` | `5` | Maximum number of tasks returned by the LLM query router |
+| `query_router_pool_size` | `48` | Maximum number of locally prefiltered tasks sent to the LLM query router |
+| `query_router_summary_limit` | `512` | Maximum characters for each compact task routing summary |
 | `prompt_path` | `""` | Prompt file or directory override |
 | `llm_api_key` | env | `DEEPSEEK_API_KEY` or `OPENAI_API_KEY` |
 | `llm_base_url` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
@@ -435,6 +453,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n tcmem python -m tcmem.evals.rea
   --session-ks 5,10,20,30 \
   --retrieval-record-k 200 \
   --evidence-top-k 20 \
+  --build-model gpt-4o-mini \
+  --eval-model gpt-4o \
   --state-save-every-records 5 \
   --prompt-path /data/wz/agent_memory/iconip2026/TCMem/tcmem/prompts \
   --with-qa \
@@ -458,6 +478,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n tcmem python -m tcmem.evals.rea
   --session-ks 5,10,20,30 \
   --retrieval-record-k 200 \
   --evidence-top-k 20 \
+  --build-model gpt-4o-mini \
+  --eval-model gpt-4o \
   --state-save-every-records 5 \
   --prompt-path /data/wz/agent_memory/iconip2026/TCMem/tcmem/prompts \
   --with-qa \
@@ -514,6 +536,8 @@ Important files:
 | `generation_results.json` | QA generated answers and evidence text |
 | `metrics_results.json` | Summary and per-query metrics |
 | `realmem_top_session_report.md` | Human-readable report |
+| `progress.jsonl` | Mirrored live progress for tailing from the result directory |
+| `progress_latest.json` | Latest progress event for quick status checks |
 | `manifest.json` | Run metadata and artifact paths |
 
 Current successful router results are persisted as filtered ids:
@@ -558,7 +582,13 @@ failed_query_count
 
 Then rerun the best 2-3 configurations with `--with-qa`.
 
-## Retrieval Parameter Sweep
+## Retrieval Parameter Sweep (deferred for this experiment)
+
+The parameter sweep is retained as legacy tooling/documentation only. Per the
+current experiment plan, do not run it; use the fixed Full-baseline versus
+w/o-task-chain commands and `scripts/run_fixed_ablation_resume.sh` instead.
+
+The historical sweep command below is not part of the current ablation result.
 
 After an evaluation has produced `memory_state_latest.json`, run retrieval-only
 sweeps without re-ingesting records:
@@ -663,7 +693,12 @@ PY
   `numpy`.
 - Successful LLM call prompts and raw responses are not saved by default.
 - Successful router reasons are not saved by default.
-- Task metadata currently updates only `task_description` and `entities`.
+- The task-level vector/BM25 routing index is not yet implemented; the current
+  fixed candidate pool still uses local lexical/entity prefiltering.
+- Branch and child-task expansion is deterministic. LLM routing chooses the
+  root task and can declare `parent_branch_id` for a newly decomposed child;
+  branch-level query scope is still represented inside the task profile rather
+  than exposed as a separate query result field.
 - Entity extraction can continue with empty entities after repeated invalid
   payloads; this protects long evaluations from stopping but may reduce graph
   quality.

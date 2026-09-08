@@ -17,6 +17,7 @@ from ..models import (
     QueryRouteDecision,
     RouteDecision,
     SessionPayload,
+    TaskBranch,
     TaskChain,
     TaskChainNode,
     TaskStatus,
@@ -29,6 +30,8 @@ DEFAULT_JSON_MAX_ATTEMPTS = 5
 DEFAULT_TASK_METADATA_REFRESH_INTERVAL = 5
 DEFAULT_ROUTER_ENTITY_LIMIT = 20
 DEFAULT_QUERY_ROUTER_CANDIDATE_COUNT = 5
+DEFAULT_QUERY_ROUTER_POOL_SIZE = 48
+DEFAULT_QUERY_ROUTER_SUMMARY_LIMIT = 512
 DEFAULT_TASK_ROUTING_CANDIDATE_COUNT = 12
 TASK_REFRESH_RECENT_NODE_LIMIT = 5
 TASK_REFRESH_TEXT_LIMIT = 500
@@ -48,6 +51,7 @@ class ConflictDecision:
     confidence: float
     reference_node_id: str | None = None
     branch_id: str | None = None
+    branch_goal: str = ""
     summary: str = ""
     task_description_update: str | None = None
 
@@ -62,6 +66,8 @@ class TaskChainManager:
         task_metadata_refresh_interval: int = DEFAULT_TASK_METADATA_REFRESH_INTERVAL,
         router_entity_limit: int = DEFAULT_ROUTER_ENTITY_LIMIT,
         query_router_candidate_count: int = DEFAULT_QUERY_ROUTER_CANDIDATE_COUNT,
+        query_router_pool_size: int = DEFAULT_QUERY_ROUTER_POOL_SIZE,
+        query_router_summary_limit: int = DEFAULT_QUERY_ROUTER_SUMMARY_LIMIT,
         prompt_registry: PromptRegistry | None = None,
     ) -> None:
         self.owner_id = owner_id
@@ -70,6 +76,14 @@ class TaskChainManager:
         self.task_metadata_refresh_interval = task_metadata_refresh_interval
         self.router_entity_limit = router_entity_limit
         self.query_router_candidate_count = _clamp_query_candidate_count(query_router_candidate_count)
+        self.query_router_pool_size = max(
+            self.query_router_candidate_count,
+            int(query_router_pool_size or DEFAULT_QUERY_ROUTER_POOL_SIZE),
+        )
+        self.query_router_summary_limit = max(
+            128,
+            int(query_router_summary_limit or DEFAULT_QUERY_ROUTER_SUMMARY_LIMIT),
+        )
         self.prompt_registry = prompt_registry or PromptRegistry.default()
         self.tasks: dict[str, TaskChain] = {}
 
@@ -245,27 +259,52 @@ class TaskChainManager:
         return self._intent_from_payload(parsed)
 
     def route_for_query(self, query: str) -> QueryRouteDecision:
-        intent = self.understand_query_intent(query)
+        try:
+            intent = self.understand_query_intent(query)
+        except Exception as exc:
+            return self._fallback_query_route(query, None, exc)
         candidate_count = min(self.query_router_candidate_count, len(self.tasks)) if self.tasks else self.query_router_candidate_count
+        candidates = self._query_routing_candidates(query, intent)
+        catalog = [
+            self._task_summary(
+                task,
+                include_recent_records=False,
+                text_limit=self.query_router_summary_limit,
+            )
+            for task in candidates
+        ]
         payload = {
             "query": query,
             "intent": to_primitive(intent),
             "candidate_count": candidate_count,
-            "task_catalog": [self._task_summary(task) for task in self.tasks.values()],
+            "task_catalog": catalog,
         }
         rendered = self.prompt_registry.render("query_routing", payload_json=_json_dumps(payload))
-        parsed = self._call_llm_json(
-            PromptBundle(
-                name="query_routing",
-                system_prompt=rendered.system_prompt,
-                user_prompt=rendered.user_prompt,
+        try:
+            parsed = self._call_llm_json(
+                PromptBundle(
+                    name="query_routing",
+                    system_prompt=rendered.system_prompt,
+                    user_prompt=rendered.user_prompt,
+                )
             )
-        )
+        except Exception as exc:
+            return self._fallback_query_route(query, intent, exc, candidate_count=candidate_count)
         if isinstance(parsed, dict):
             parsed = _unwrap_schema_response(parsed, expected_keys={"routed_task_ids"})
         if not isinstance(parsed, dict):
-            raise RuntimeError("LLM query routing returned invalid payload")
-        routed = [str(task_id) for task_id in parsed.get("routed_task_ids", []) or [] if str(task_id) in self.tasks]
+            return self._fallback_query_route(
+                query,
+                intent,
+                RuntimeError("LLM query routing returned invalid payload"),
+                candidate_count=candidate_count,
+            )
+        candidate_task_ids = {task.task_id for task in candidates}
+        routed = [
+            str(task_id)
+            for task_id in parsed.get("routed_task_ids", []) or []
+            if str(task_id) in candidate_task_ids
+        ]
         routed = routed[:candidate_count]
         decision = QueryRouteDecision(
             query=query,
@@ -280,16 +319,60 @@ class TaskChainManager:
                 "query_routed",
                 query=query,
                 candidate_count=candidate_count,
+                candidate_pool_size=len(candidates),
+                total_task_count=len(self.tasks),
+                catalog_chars=len(_json_dumps(catalog)),
                 routed_task_ids=routed,
                 query_intent=to_primitive(intent),
                 reason=decision.reason,
             )
         return decision
 
+    def _fallback_query_route(
+        self,
+        query: str,
+        intent: IntentUnderstanding | None,
+        error: Exception,
+        *,
+        candidate_count: int | None = None,
+    ) -> QueryRouteDecision:
+        fallback_intent = intent or IntentUnderstanding(
+            main_intent=query,
+            summary=query,
+            is_substantive=True,
+            reason="query_router_fallback",
+        )
+        reason = f"query_router_fallback:{type(error).__name__}"
+        log = getattr(self.log_store, "log", None)
+        if log is not None:
+            log(
+                "routing",
+                "query_route_fallback",
+                query=query,
+                candidate_count=candidate_count if candidate_count is not None else self.query_router_candidate_count,
+                total_task_count=len(self.tasks),
+                error_type=type(error).__name__,
+                error=str(error)[:500],
+                query_intent=to_primitive(fallback_intent),
+                reason=reason,
+            )
+        return QueryRouteDecision(
+            query=query,
+            routed_task_ids=[],
+            query_intent=fallback_intent,
+            reason=reason,
+        )
+
     def create_task_from_record(self, record: DialogueRecord, spec: dict[str, Any]) -> TaskChain:
         task_description = str(spec.get("task_description", "") or "").strip()
         if not task_description:
             raise ValueError("new task spec must include task_description")
+        canonical_description = str(
+            spec.get("canonical_description", task_description) or task_description
+        ).strip()
+        current_focus = str(spec.get("current_focus", "") or "").strip()
+        parent_task_id = str(spec.get("parent_task_id", "") or "").strip() or None
+        parent_branch_id = str(spec.get("parent_branch_id", "") or "").strip() or None
         task = TaskChain(
             task_id=f"task_{uuid4().hex[:8]}",
             task_description=task_description,
@@ -297,8 +380,42 @@ class TaskChainManager:
             created_at=record.current_time,
             updated_at=record.current_time,
             entities=list(record.entities),
+            canonical_description=canonical_description,
+            current_focus=current_focus,
+            parent_task_id=parent_task_id,
+            parent_branch_id=parent_branch_id,
         )
+        parent = self.tasks.get(parent_task_id) if parent_task_id else None
+        if parent_task_id and parent is None:
+            raise ValueError(f"unknown parent_task_id {parent_task_id!r}")
+        if parent_branch_id:
+            if parent is None:
+                raise ValueError(
+                    f"parent_branch_id {parent_branch_id!r} requires an existing parent_task_id"
+                )
+            self._ensure_legacy_branch_registry(parent)
+            if parent_branch_id not in parent.branches:
+                raise ValueError(
+                    f"unknown parent_branch_id {parent_branch_id!r} for task {parent_task_id}"
+                )
         self.tasks[task.task_id] = task
+        branch_id = str(spec.get("branch_id", "main") or "main").strip() or "main"
+        branch_goal = str(spec.get("branch_goal", canonical_description) or canonical_description).strip()
+        self._ensure_branch(
+            task,
+            branch_id,
+            branch_goal=branch_goal,
+            current_focus=current_focus,
+            created_at=record.current_time,
+        )
+        if parent is not None:
+            self._ensure_legacy_branch_registry(parent)
+            if task.task_id not in parent.child_task_ids:
+                parent.child_task_ids.append(task.task_id)
+            if parent_branch_id:
+                branch = parent.branches[parent_branch_id]
+                if task.task_id not in branch.child_task_ids:
+                    branch.child_task_ids.append(task.task_id)
         self._log_task_chain_event(
             task.task_id,
             "task_chain_created",
@@ -309,7 +426,23 @@ class TaskChainManager:
             created_at=task.created_at,
             source_record_id=record.record_id,
             entities=list(task.entities),
+            canonical_description=task.canonical_description,
+            current_focus=task.current_focus,
+            parent_task_id=task.parent_task_id,
+            parent_branch_id=parent_branch_id,
+            branch_id=branch_id,
+            branch_goal=branch_goal,
         )
+        if parent_task_id and parent_task_id in self.tasks:
+            self._log_task_chain_event(
+                parent_task_id,
+                "child_task_linked",
+                parent_task_id=parent_task_id,
+                child_task_id=task.task_id,
+                parent_branch_id=parent_branch_id,
+                relation="decomposition",
+                created_at=record.current_time,
+            )
         return task
 
     def apply_record(self, task_id: str, record: DialogueRecord, *, summary: str | None = None) -> ChainUpdateResult:
@@ -324,6 +457,7 @@ class TaskChainManager:
         record_intent: IntentUnderstanding | None = None,
     ) -> ChainUpdateResult:
         task = self.tasks[task_id]
+        self._ensure_legacy_branch_registry(task)
 
         prior_application = self._get_record_application(task, record.record_id)
         if prior_application is not None:
@@ -416,6 +550,17 @@ class TaskChainManager:
         else:
             raise ValueError(f"Unknown conflict action {decision.action!r} for record {record.record_id}")
 
+        prior_active_branch_id = task.active_branch_id or task.preferred_branch_id or "main"
+
+        self._ensure_branch(
+            task,
+            branch_id,
+            branch_goal=decision.branch_goal or task.canonical_description or task.task_description,
+            current_focus=decision.summary,
+            parent_node_id=target_node.node_id if target_node is not None and decision.action == "branch" else None,
+            created_at=record.current_time,
+        )
+
         prior_head = task.nodes.get(task.branch_heads.get(branch_id, ""))
         new_node = self._make_node(task, record, decision, status, branch_id)
         if record_intent is not None:
@@ -451,6 +596,23 @@ class TaskChainManager:
         self._merge_task_entities(task, record)
         task.branch_heads[branch_id] = new_node.node_id
         task.active_branch_id = branch_id
+        branch = self._ensure_branch(task, branch_id, head_node_id=new_node.node_id)
+        branch.head_node_id = new_node.node_id
+        branch.current_focus = _short_text(new_node.summary or task.current_focus, 256)
+        branch.updated_at = record.current_time
+        branch.last_activity_at = record.current_time
+        task.preferred_branch_id = branch_id
+        task.current_focus = branch.current_focus
+        if decision.action == "branch" and prior_active_branch_id != branch_id:
+            self._log_task_chain_event(
+                task.task_id,
+                "branch_selected",
+                task_id=task.task_id,
+                old_branch_id=prior_active_branch_id,
+                new_branch_id=branch_id,
+                updated_at=record.current_time,
+                reason="conflict_resolution_branch_action",
+            )
         self._apply_task_metadata_updates(task, decision)
         task.updated_at = record.current_time
 
@@ -497,6 +659,654 @@ class TaskChainManager:
     def get_task(self, task_id: str) -> TaskChain | None:
         return self.tasks.get(task_id)
 
+    def expand_task_ids(self, task_ids: list[str], *, max_tasks: int = 20) -> list[str]:
+        """Return deterministic task IDs while preserving the legacy API."""
+        expanded, _edges = self.expand_task_graph(task_ids, max_tasks=max_tasks)
+        return expanded
+
+    def expand_task_graph(
+        self,
+        task_ids: list[str],
+        *,
+        max_tasks: int = 20,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Expand primary routes and expose deterministic hierarchy edges.
+
+        The LLM still chooses a fixed-size primary route. Expansion is a
+        local graph operation, so callers can distinguish model-selected
+        tasks from evidence added through parent/child links.
+        """
+        limit = max(1, int(max_tasks or 20))
+        expanded: list[str] = []
+        seen: set[str] = set()
+        depths: dict[str, int] = {}
+        edges: list[dict[str, Any]] = []
+
+        def add(task_id: str, *, depth: int) -> bool:
+            if task_id in seen or task_id not in self.tasks or len(expanded) >= limit:
+                return False
+            seen.add(task_id)
+            expanded.append(task_id)
+            depths[task_id] = depth
+            return True
+
+        primary = [str(task_id) for task_id in task_ids]
+        for task_id in primary:
+            add(task_id, depth=0)
+        # Breadth-first expansion keeps primary order while supporting an
+        # arbitrarily deep task tree until the deterministic budget is full.
+        queue: list[tuple[str, str | None]] = [(task_id, None) for task_id in expanded]
+        processed: set[tuple[str, str | None]] = set()
+        while queue and len(expanded) < limit:
+            task_id, branch_filter = queue.pop(0)
+            state_key = (task_id, branch_filter)
+            if state_key in processed:
+                continue
+            processed.add(state_key)
+            task = self.tasks.get(task_id)
+            if task is None:
+                continue
+            source_depth = depths.get(task_id, 0)
+            neighbors: list[tuple[str, str]] = []
+            if task.parent_task_id:
+                neighbors.append((str(task.parent_task_id), "parent"))
+            child_ids = []
+            for child_id in task.child_task_ids:
+                child = self.tasks.get(str(child_id))
+                if child is None or child.parent_task_id != task.task_id:
+                    continue
+                child_branch_id = child.parent_branch_id
+                if branch_filter is not None and child_branch_id != branch_filter:
+                    continue
+                if branch_filter is None and child_branch_id:
+                    branch = task.branches.get(child_branch_id)
+                    if branch is not None and branch.status is not TaskStatus.ACTIVE:
+                        continue
+                child_ids.append((str(child_id), "branch_child" if child_branch_id else "child"))
+            neighbors.extend(child_ids)
+            for branch in task.branches.values():
+                if branch_filter is not None and branch.branch_id != branch_filter:
+                    continue
+                if branch_filter is None and branch.status is not TaskStatus.ACTIVE:
+                    continue
+                for child_id in branch.child_task_ids:
+                    child = self.tasks.get(str(child_id))
+                    if child is None or child.parent_task_id != task.task_id:
+                        continue
+                    if branch_filter is not None and child.parent_branch_id != branch_filter:
+                        continue
+                    neighbors.append((str(child_id), "branch_child"))
+            for neighbor, relation in neighbors:
+                if add(neighbor, depth=source_depth + 1):
+                    edges.append(
+                        {
+                            "from": task_id,
+                            "to": neighbor,
+                            "relation": relation,
+                            "depth": source_depth + 1,
+                        }
+                    )
+                    next_filter = branch_filter
+                    if relation == "parent":
+                        source = self.tasks.get(task_id)
+                        next_filter = source.parent_branch_id if source is not None else None
+                    queue.append((neighbor, next_filter))
+        return expanded, edges
+
+    def task_routing_profile(self, task: TaskChain) -> dict[str, Any]:
+        """Return the compact, stable routing projection for one task."""
+        self._ensure_legacy_branch_registry(task)
+        branches = []
+        for branch in sorted(task.branches.values(), key=lambda item: item.branch_id):
+            branches.append(
+                {
+                    "branch_id": branch.branch_id,
+                    "branch_goal": _short_text(branch.branch_goal, 256),
+                    "current_focus": _short_text(branch.current_focus, 256),
+                    "status": branch.status.value,
+                    "head_node_id": branch.head_node_id,
+                    "child_task_ids": list(branch.child_task_ids)[:8],
+                }
+            )
+        return {
+            "task_id": task.task_id,
+            "canonical_description": _short_text(
+                task.canonical_description or task.task_description,
+                self.query_router_summary_limit,
+            ),
+            "current_focus": _short_text(task.current_focus, 256),
+            "status": task.status.value,
+            "entities": [_short_text(entity, 64) for entity in task.entities[: self.router_entity_limit]],
+            "parent_task_id": task.parent_task_id,
+            "parent_branch_id": task.parent_branch_id,
+            "child_task_ids": list(task.child_task_ids)[:8],
+            "branches": branches[:8],
+            "updated_at": task.updated_at or task.created_at,
+        }
+
+    def get_branch(self, task_id: str, branch_id: str) -> TaskBranch | None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            return None
+        self._ensure_legacy_branch_registry(task)
+        return task.branches.get(branch_id)
+
+    def create_branch(
+        self,
+        task_id: str,
+        branch_goal: str,
+        *,
+        parent_node_id: str | None = None,
+        branch_id: str | None = None,
+        current_focus: str = "",
+        current_time: str = "",
+        reason: str = "",
+    ) -> TaskBranch:
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise KeyError(f"unknown task_id {task_id!r}")
+        goal = str(branch_goal or "").strip()
+        if not goal:
+            raise ValueError("branch_goal is required")
+        self._ensure_legacy_branch_registry(task)
+        if parent_node_id and parent_node_id not in task.nodes:
+            raise ValueError(f"unknown parent_node_id {parent_node_id!r} for task {task_id}")
+        requested_id = str(branch_id or "").strip()
+        if requested_id:
+            if requested_id in task.branches:
+                raise ValueError(f"branch {requested_id!r} already exists for task {task_id}")
+            resolved_id = requested_id
+        else:
+            resolved_id = self._next_branch_id(task)
+        branch = self._ensure_branch(
+            task,
+            resolved_id,
+            branch_goal=goal,
+            current_focus=current_focus,
+            parent_node_id=parent_node_id,
+            created_at=current_time or task.updated_at or task.created_at,
+        )
+        task.status = TaskStatus.ACTIVE
+        if current_time:
+            task.updated_at = current_time
+        self._log_task_chain_event(
+            task.task_id,
+            "branch_created",
+            task_id=task.task_id,
+            branch_id=resolved_id,
+            branch_goal=branch.branch_goal,
+            current_focus=branch.current_focus,
+            parent_node_id=parent_node_id,
+            created_at=branch.created_at,
+            reason=reason,
+        )
+        return branch
+
+    def select_branch(
+        self,
+        task_id: str,
+        branch_id: str,
+        *,
+        current_time: str = "",
+        reason: str = "",
+    ) -> TaskBranch:
+        """Select an existing branch for subsequent ordinary node writes."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise KeyError(f"unknown task_id {task_id!r}")
+        self._ensure_legacy_branch_registry(task)
+        branch = task.branches.get(str(branch_id))
+        if branch is None:
+            raise KeyError(f"unknown branch_id {branch_id!r} for task {task_id}")
+        if branch.status is TaskStatus.MERGED:
+            raise ValueError(f"cannot select merged branch {branch_id!r}")
+        old_branch_id = task.active_branch_id or task.preferred_branch_id or "main"
+        task.active_branch_id = branch.branch_id
+        task.preferred_branch_id = branch.branch_id
+        if branch.current_focus:
+            task.current_focus = branch.current_focus
+        if current_time:
+            task.updated_at = current_time
+            branch.updated_at = current_time
+            branch.last_activity_at = current_time
+        self._log_task_chain_event(
+            task.task_id,
+            "branch_selected",
+            task_id=task.task_id,
+            old_branch_id=old_branch_id,
+            new_branch_id=branch.branch_id,
+            updated_at=current_time or task.updated_at,
+            reason=reason,
+        )
+        return branch
+
+    def update_branch_status(
+        self,
+        task_id: str,
+        branch_id: str,
+        status: TaskStatus | str,
+        *,
+        current_focus: str | None = None,
+        current_time: str = "",
+        reason: str = "",
+    ) -> TaskBranch:
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise KeyError(f"unknown task_id {task_id!r}")
+        self._ensure_legacy_branch_registry(task)
+        branch = task.branches.get(branch_id)
+        if branch is None:
+            raise KeyError(f"unknown branch_id {branch_id!r} for task {task_id}")
+        resolved_status = _coerce_task_status(status, strict=True)
+        if resolved_status is TaskStatus.MERGED:
+            raise ValueError("MERGED is managed by merge_branches()")
+        old_status = branch.status
+        branch.status = resolved_status
+        if current_focus is not None:
+            branch.current_focus = _short_text(current_focus, 256)
+            if task.preferred_branch_id == branch_id or task.active_branch_id == branch_id:
+                task.current_focus = branch.current_focus
+        if current_time:
+            branch.updated_at = current_time
+            branch.last_activity_at = current_time
+            task.updated_at = current_time
+        self._sync_task_status_from_branches(task)
+        self._log_task_chain_event(
+            task.task_id,
+            "branch_status_updated",
+            task_id=task.task_id,
+            branch_id=branch_id,
+            status=branch.status.value,
+            old_status=old_status.value,
+            new_status=branch.status.value,
+            current_focus=branch.current_focus,
+            updated_at=branch.updated_at,
+            reason=reason,
+        )
+        return branch
+
+    def merge_branches(
+        self,
+        task_id: str,
+        source_branch_id: str,
+        target_branch_id: str,
+        *,
+        current_time: str = "",
+        reason: str = "",
+    ) -> TaskBranch:
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise KeyError(f"unknown task_id {task_id!r}")
+        self._ensure_legacy_branch_registry(task)
+        if source_branch_id == target_branch_id:
+            raise ValueError("source_branch_id and target_branch_id must differ")
+        source = task.branches.get(source_branch_id)
+        target = task.branches.get(target_branch_id)
+        if source is None or target is None:
+            raise KeyError(f"unknown branch for merge: {source_branch_id!r}, {target_branch_id!r}")
+        if source.status is TaskStatus.MERGED:
+            raise ValueError(f"branch {source_branch_id!r} is already merged")
+        if target.status is TaskStatus.MERGED:
+            raise ValueError(f"cannot merge into merged branch {target_branch_id!r}")
+        reparented_child_ids: list[str] = []
+        historical_child_ids: list[str] = []
+        for child_id in list(source.child_task_ids):
+            child = self.tasks.get(child_id)
+            if child is None:
+                continue
+            historical_child_ids.append(child_id)
+            if child.parent_task_id == task.task_id and child.parent_branch_id == source_branch_id:
+                child.parent_branch_id = target_branch_id
+                if child_id not in target.child_task_ids:
+                    target.child_task_ids.append(child_id)
+                reparented_child_ids.append(child_id)
+        source.child_task_ids = [child_id for child_id in source.child_task_ids if child_id not in reparented_child_ids]
+        if historical_child_ids:
+            prior_history = list(source.metadata.get("merged_child_task_ids", []) or [])
+            source.metadata["merged_child_task_ids"] = list(dict.fromkeys([*prior_history, *historical_child_ids]))
+        source.status = TaskStatus.MERGED
+        source.merged_into_branch_id = target_branch_id
+        source.updated_at = current_time or source.updated_at
+        if current_time:
+            source.last_activity_at = current_time
+            task.updated_at = current_time
+        self._sync_task_status_from_branches(task)
+        self._log_task_chain_event(
+            task.task_id,
+            "branch_merged",
+            task_id=task.task_id,
+            source_branch_id=source_branch_id,
+            target_branch_id=target_branch_id,
+            status=source.status.value,
+            merged_into_branch_id=target_branch_id,
+            reparented_child_task_ids=reparented_child_ids,
+            updated_at=source.updated_at,
+            reason=reason,
+        )
+        for child_id in reparented_child_ids:
+            self._log_task_chain_event(
+                task.task_id,
+                "child_task_reparented",
+                parent_task_id=task.task_id,
+                child_task_id=child_id,
+                old_parent_branch_id=source_branch_id,
+                new_parent_branch_id=target_branch_id,
+                reason="branch_merge",
+                updated_at=current_time or task.updated_at,
+            )
+        return target
+
+    def create_child_task(
+        self,
+        parent_task_id: str,
+        canonical_description: str,
+        *,
+        current_focus: str = "",
+        entities: list[str] | None = None,
+        branch_goal: str = "",
+        parent_branch_id: str | None = None,
+        current_time: str = "",
+        task_id: str | None = None,
+        reason: str = "decomposition",
+    ) -> TaskChain:
+        parent = self.tasks.get(parent_task_id)
+        if parent is None:
+            raise KeyError(f"unknown parent task_id {parent_task_id!r}")
+        description = str(canonical_description or "").strip()
+        if not description:
+            raise ValueError("child task canonical_description is required")
+        child_id = str(task_id or "").strip() or f"task_{uuid4().hex[:8]}"
+        if child_id in self.tasks:
+            raise ValueError(f"task {child_id!r} already exists")
+        self._ensure_legacy_branch_registry(parent)
+        resolved_parent_branch_id = str(parent_branch_id or "").strip() or None
+        if resolved_parent_branch_id and resolved_parent_branch_id not in parent.branches:
+            raise ValueError(
+                f"unknown parent_branch_id {resolved_parent_branch_id!r} for task {parent_task_id}"
+            )
+        timestamp = current_time or parent.updated_at or parent.created_at
+        child = TaskChain(
+            task_id=child_id,
+            task_description=description,
+            owner_id=self.owner_id,
+            created_at=timestamp,
+            updated_at=timestamp,
+            entities=self._normalize_entities(entities or []),
+            canonical_description=description,
+            current_focus=str(current_focus or "").strip(),
+            parent_task_id=parent_task_id,
+            parent_branch_id=resolved_parent_branch_id,
+        )
+        self.tasks[child_id] = child
+        self._ensure_branch(
+            child,
+            "main",
+            branch_goal=str(branch_goal or description).strip(),
+            current_focus=child.current_focus,
+            created_at=timestamp,
+        )
+        if child_id not in parent.child_task_ids:
+            parent.child_task_ids.append(child_id)
+        if resolved_parent_branch_id:
+            branch = parent.branches[resolved_parent_branch_id]
+            if child_id not in branch.child_task_ids:
+                branch.child_task_ids.append(child_id)
+            if current_time:
+                branch.updated_at = current_time
+                branch.last_activity_at = current_time
+        if current_time:
+            parent.updated_at = current_time
+        self._log_task_chain_event(
+            child_id,
+            "task_chain_created",
+            task_id=child_id,
+            task_description=child.task_description,
+            canonical_description=child.canonical_description,
+            current_focus=child.current_focus,
+            parent_task_id=parent_task_id,
+            parent_branch_id=resolved_parent_branch_id,
+            status=child.status.value,
+            created_at=child.created_at,
+            entities=list(child.entities),
+            relation=reason,
+        )
+        self._log_task_chain_event(
+            parent_task_id,
+            "child_task_linked",
+            parent_task_id=parent_task_id,
+            child_task_id=child_id,
+            parent_branch_id=resolved_parent_branch_id,
+            relation=reason,
+            created_at=timestamp,
+        )
+        return child
+
+    def _next_branch_id(self, task: TaskChain) -> str:
+        while True:
+            branch_id = f"b{task.next_branch_index}"
+            task.next_branch_index += 1
+            if branch_id not in task.branches:
+                return branch_id
+
+    def _ensure_branch(
+        self,
+        task: TaskChain,
+        branch_id: str,
+        *,
+        branch_goal: str = "",
+        current_focus: str = "",
+        parent_node_id: str | None = None,
+        created_at: str = "",
+        head_node_id: str | None = None,
+        status: TaskStatus = TaskStatus.ACTIVE,
+    ) -> TaskBranch:
+        branch = task.branches.get(branch_id)
+        if branch is None:
+            branch = TaskBranch(
+                branch_id=branch_id,
+                task_id=task.task_id,
+                branch_goal=str(branch_goal or task.canonical_description or task.task_description).strip(),
+                current_focus=_short_text(current_focus, 256),
+                status=status,
+                head_node_id=head_node_id or task.branch_heads.get(branch_id),
+                parent_node_id=parent_node_id,
+                created_at=created_at or task.created_at,
+                updated_at=created_at or task.updated_at or task.created_at,
+                last_activity_at=created_at or task.updated_at or task.created_at,
+            )
+            task.branches[branch_id] = branch
+        else:
+            if branch_goal and not branch.branch_goal:
+                branch.branch_goal = str(branch_goal).strip()
+            if current_focus:
+                branch.current_focus = _short_text(current_focus, 256)
+            if parent_node_id and branch.parent_node_id is None:
+                branch.parent_node_id = parent_node_id
+            if head_node_id:
+                branch.head_node_id = head_node_id
+        if branch.head_node_id:
+            task.branch_heads[branch_id] = branch.head_node_id
+        elif branch_id in task.branch_heads:
+            branch.head_node_id = task.branch_heads[branch_id]
+        task.preferred_branch_id = task.preferred_branch_id or task.active_branch_id or branch_id
+        return branch
+
+    def _ensure_legacy_branch_registry(self, task: TaskChain) -> None:
+        if not task.canonical_description:
+            task.canonical_description = task.task_description
+        if task.preferred_branch_id is None:
+            task.preferred_branch_id = task.active_branch_id or "main"
+        branch_ids = set(task.branch_heads) | set(task.branches)
+        branch_ids.add(task.active_branch_id or "main")
+        for node in task.nodes.values():
+            branch_ids.add(node.branch_id or "main")
+        for branch_id in sorted(branch_ids):
+            self._ensure_branch(
+                task,
+                branch_id,
+                current_focus=task.current_focus if branch_id == task.preferred_branch_id else "",
+                head_node_id=task.branch_heads.get(branch_id),
+            )
+
+    def _sync_task_status_from_branches(self, task: TaskChain) -> None:
+        statuses = [branch.status for branch in task.branches.values()]
+        if not statuses:
+            return
+        if any(status is TaskStatus.ACTIVE for status in statuses):
+            task.status = TaskStatus.ACTIVE
+        elif any(status is TaskStatus.BLOCKED for status in statuses):
+            task.status = TaskStatus.BLOCKED
+        elif all(status in {TaskStatus.COMPLETED, TaskStatus.MERGED, TaskStatus.CANCELLED} for status in statuses):
+            task.status = TaskStatus.COMPLETED
+
+    def rebuild_hierarchy_links(self) -> None:
+        """Normalize parent/child links and branch heads after state loading.
+
+        Child-side parent fields are the source of truth. Legacy parent-side
+        lists may be stale or absent, so they are rebuilt in task insertion
+        order after all tasks and branches are available.
+        """
+        for task in self.tasks.values():
+            self._ensure_legacy_branch_registry(task)
+            task.child_task_ids = []
+            for branch_id, branch in task.branches.items():
+                if branch.task_id and branch.task_id != task.task_id:
+                    raise ValueError(
+                        f"branch {branch_id} belongs to {branch.task_id}, expected {task.task_id}"
+                    )
+                if branch.branch_id and branch.branch_id != branch_id:
+                    raise ValueError(
+                        f"branch key {branch_id} disagrees with branch id {branch.branch_id}"
+                    )
+                branch.task_id = task.task_id
+                branch.branch_id = branch_id
+                branch.child_task_ids = []
+
+            # A stale branch head is less trustworthy than the node's branch
+            # identity. Recompute heads from the latest node in each branch.
+            task.branch_heads = {}
+            nodes_by_branch: dict[str, list[TaskChainNode]] = {}
+            for node in task.nodes.values():
+                branch_id = str(node.branch_id or "main")
+                node.branch_id = branch_id
+                self._ensure_branch(task, branch_id)
+                nodes_by_branch.setdefault(branch_id, []).append(node)
+            for branch_id, branch in task.branches.items():
+                nodes = nodes_by_branch.get(branch_id, [])
+                if nodes:
+                    head = max(nodes, key=lambda item: (item.position, item.created_at, item.node_id))
+                    branch.head_node_id = head.node_id
+                    task.branch_heads[branch_id] = head.node_id
+                else:
+                    branch.head_node_id = None
+
+        for task in self.tasks.values():
+            parent_id = task.parent_task_id
+            if not parent_id:
+                task.parent_branch_id = None
+                continue
+            parent = self.tasks.get(parent_id)
+            if parent is None:
+                task.parent_task_id = None
+                task.parent_branch_id = None
+                continue
+            if parent_id == task.task_id:
+                raise ValueError(f"task {task.task_id} cannot be its own parent")
+            parent.child_task_ids.append(task.task_id)
+            parent_branch_id = task.parent_branch_id
+            if not parent_branch_id:
+                continue
+            branch = parent.branches.get(parent_branch_id)
+            if branch is None:
+                task.parent_branch_id = None
+                continue
+            branch.child_task_ids.append(task.task_id)
+
+        for task in self.tasks.values():
+            task.child_task_ids = list(dict.fromkeys(task.child_task_ids))
+            for branch in task.branches.values():
+                branch.child_task_ids = list(dict.fromkeys(branch.child_task_ids))
+
+        # Parent links form a forest. Detect a cycle after dangling links have
+        # been cleared so corrupted persisted state cannot poison expansion.
+        for start in self.tasks.values():
+            path: set[str] = set()
+            current = start
+            while current.parent_task_id:
+                if current.task_id in path:
+                    cycle = " -> ".join(sorted(path))
+                    raise ValueError(f"task parent cycle detected: {cycle}")
+                path.add(current.task_id)
+                parent = self.tasks.get(current.parent_task_id)
+                if parent is None:
+                    break
+                current = parent
+
+    def validate_hierarchy(self) -> None:
+        """Raise ``ValueError`` when persisted hierarchy invariants are broken."""
+        task_ids = set(self.tasks)
+        for task in self.tasks.values():
+            if task.parent_task_id:
+                if task.parent_task_id == task.task_id:
+                    raise ValueError(f"task {task.task_id} cannot be its own parent")
+                if task.parent_task_id not in task_ids:
+                    raise ValueError(
+                        f"task {task.task_id} references missing parent {task.parent_task_id}"
+                    )
+                if task.parent_branch_id and task.parent_branch_id not in self.tasks[task.parent_task_id].branches:
+                    raise ValueError(
+                        f"task {task.task_id} references missing parent branch {task.parent_branch_id}"
+                    )
+            for branch_id, branch in task.branches.items():
+                if branch.task_id != task.task_id:
+                    raise ValueError(
+                        f"branch {branch_id} belongs to {branch.task_id}, expected {task.task_id}"
+                    )
+                if branch.head_node_id:
+                    head = task.nodes.get(branch.head_node_id)
+                    if head is None:
+                        raise ValueError(
+                            f"branch {branch_id} references missing head node {branch.head_node_id}"
+                        )
+                    if head.task_id != task.task_id or head.branch_id != branch_id:
+                        raise ValueError(
+                            f"branch {branch_id} head {branch.head_node_id} has inconsistent ownership"
+                        )
+            for node in task.nodes.values():
+                if node.task_id != task.task_id:
+                    raise ValueError(
+                        f"node {node.node_id} belongs to {node.task_id}, expected {task.task_id}"
+                    )
+                if node.branch_id not in task.branches:
+                    raise ValueError(
+                        f"node {node.node_id} references missing branch {node.branch_id}"
+                    )
+            for child_id in task.child_task_ids:
+                child = self.tasks.get(child_id)
+                if child is None:
+                    raise ValueError(f"task {task.task_id} has dangling child {child_id}")
+                if child.parent_task_id != task.task_id:
+                    raise ValueError(
+                        f"task {task.task_id} child link {child_id} disagrees with child parent"
+                    )
+            for branch_id, branch in task.branches.items():
+                for child_id in branch.child_task_ids:
+                    child = self.tasks.get(child_id)
+                    if child is None:
+                        raise ValueError(f"branch {branch_id} has dangling child {child_id}")
+                    if child.parent_task_id != task.task_id or child.parent_branch_id != branch_id:
+                        raise ValueError(
+                            f"branch {branch_id} child link {child_id} disagrees with child parent branch"
+                        )
+        for start in self.tasks.values():
+            path: set[str] = set()
+            current = start
+            while current.parent_task_id:
+                if current.task_id in path:
+                    raise ValueError(f"task parent cycle detected at {current.task_id}")
+                path.add(current.task_id)
+                current = self.tasks[current.parent_task_id]
+
     def _merge_task_entities(self, task: TaskChain, record: DialogueRecord) -> None:
         task.entities = self._normalize_entities([*task.entities, *record.entities])
 
@@ -504,7 +1314,10 @@ class TaskChainManager:
         if decision.task_description_update is not None:
             updated = decision.task_description_update.strip()
             if updated:
-                task.task_description = updated
+                task.current_focus = _short_text(updated, 256)
+                branch_id = task.preferred_branch_id or task.active_branch_id or "main"
+                branch = self._ensure_branch(task, branch_id)
+                branch.current_focus = task.current_focus
 
     def _find_node_for_record(self, task: TaskChain, record_id: str) -> TaskChainNode | None:
         for node in task.nodes.values():
@@ -635,8 +1448,13 @@ class TaskChainManager:
         payload = {
             "task": {
                 "task_id": task.task_id,
-                "task_description": task.task_description,
+                "task_description": task.canonical_description or task.task_description,
+                "current_focus": task.current_focus,
                 "status": task.status.value,
+                "parent_task_id": task.parent_task_id,
+                "parent_branch_id": task.parent_branch_id,
+                "child_task_ids": list(task.child_task_ids)[:8],
+                "branches": self.task_routing_profile(task)["branches"][:8],
             },
             "record": record_payload,
             "recent_context": self._recent_context(task),
@@ -659,6 +1477,7 @@ class TaskChainManager:
             confidence=float(parsed.get("confidence", 0.0) or 0.0),
             reference_node_id=str(parsed.get("reference_node_id")) if parsed.get("reference_node_id") else None,
             branch_id=str(parsed.get("branch_id")) if parsed.get("branch_id") else None,
+            branch_goal=str(parsed.get("branch_goal", "") or "").strip(),
             summary=str(parsed.get("summary", "") or ""),
             task_description_update=(
                 str(parsed.get("task_description_update")).strip()
@@ -676,6 +1495,7 @@ class TaskChainManager:
                 action=decision.action,
                 reference_node_id=decision.reference_node_id,
                 branch_id=decision.branch_id,
+                branch_goal=decision.branch_goal,
                 reason=decision.reason,
                 summary=decision.summary,
                 task_description_update=decision.task_description_update,
@@ -718,6 +1538,7 @@ class TaskChainManager:
             previous_node.next_node_ids.append(next_node.node_id)
 
     def to_state(self) -> dict:
+        self.validate_hierarchy()
         return {"owner_id": self.owner_id, "tasks": [to_primitive(task) for task in self.tasks.values()]}
 
     @classmethod
@@ -729,6 +1550,8 @@ class TaskChainManager:
         task_metadata_refresh_interval: int = DEFAULT_TASK_METADATA_REFRESH_INTERVAL,
         router_entity_limit: int = DEFAULT_ROUTER_ENTITY_LIMIT,
         query_router_candidate_count: int = DEFAULT_QUERY_ROUTER_CANDIDATE_COUNT,
+        query_router_pool_size: int = DEFAULT_QUERY_ROUTER_POOL_SIZE,
+        query_router_summary_limit: int = DEFAULT_QUERY_ROUTER_SUMMARY_LIMIT,
         prompt_registry: PromptRegistry | None = None,
     ) -> "TaskChainManager":
         manager = cls(
@@ -737,6 +1560,8 @@ class TaskChainManager:
             task_metadata_refresh_interval=task_metadata_refresh_interval,
             router_entity_limit=router_entity_limit,
             query_router_candidate_count=query_router_candidate_count,
+            query_router_pool_size=query_router_pool_size,
+            query_router_summary_limit=query_router_summary_limit,
             prompt_registry=prompt_registry,
         )
         for task_data in state.get("tasks", []) or []:
@@ -744,7 +1569,7 @@ class TaskChainManager:
                 task_id=task_data["task_id"],
                 task_description=task_data.get("task_description") or task_data.get("topic", ""),
                 owner_id=task_data.get("owner_id", manager.owner_id),
-                status=_coerce_task_status(task_data.get("status")),
+                status=_coerce_task_status(task_data.get("status"), strict=True),
                 created_at=task_data.get("created_at", ""),
                 updated_at=task_data.get("updated_at", ""),
                 entities=task_data.get("entities", []) or [],
@@ -753,8 +1578,32 @@ class TaskChainManager:
                 next_node_index=int(task_data.get("next_node_index", 1) or 1),
                 next_branch_index=int(task_data.get("next_branch_index", 1) or 1),
                 active_branch_id=task_data.get("active_branch_id", "main"),
+                canonical_description=task_data.get("canonical_description", "") or task_data.get("task_description", ""),
+                current_focus=task_data.get("current_focus", "") or "",
+                parent_task_id=task_data.get("parent_task_id"),
+                parent_branch_id=task_data.get("parent_branch_id"),
+                child_task_ids=task_data.get("child_task_ids", []) or [],
+                preferred_branch_id=task_data.get("preferred_branch_id"),
                 metadata=task_data.get("metadata", {}) or {},
             )
+            for branch_id, branch_data in (task_data.get("branches", {}) or {}).items():
+                if not isinstance(branch_data, dict):
+                    continue
+                task.branches[branch_id] = TaskBranch(
+                    branch_id=branch_data.get("branch_id", branch_id),
+                    task_id=branch_data.get("task_id", task.task_id),
+                    branch_goal=branch_data.get("branch_goal", "") or "",
+                    current_focus=branch_data.get("current_focus", "") or "",
+                    status=_coerce_task_status(branch_data.get("status"), strict=True),
+                    head_node_id=branch_data.get("head_node_id"),
+                    parent_node_id=branch_data.get("parent_node_id"),
+                    child_task_ids=branch_data.get("child_task_ids", []) or [],
+                    created_at=branch_data.get("created_at", "") or "",
+                    updated_at=branch_data.get("updated_at", "") or "",
+                    last_activity_at=branch_data.get("last_activity_at", "") or "",
+                    merged_into_branch_id=branch_data.get("merged_into_branch_id"),
+                    metadata=branch_data.get("metadata", {}) or {},
+                )
             for node_id, node_data in (task_data.get("nodes", {}) or {}).items():
                 task.nodes[node_id] = TaskChainNode(
                     node_id=node_data["node_id"],
@@ -774,6 +1623,9 @@ class TaskChainManager:
                     metadata=node_data.get("metadata", {}) or {},
                 )
             manager.tasks[task.task_id] = task
+            manager._ensure_legacy_branch_registry(task)
+        manager.rebuild_hierarchy_links()
+        manager.validate_hierarchy()
         return manager
 
     def _call_llm_json(self, bundle: PromptBundle) -> dict[str, Any] | list[Any]:
@@ -839,24 +1691,138 @@ class TaskChainManager:
             **context,
         )
 
-    def _task_summary(self, task: TaskChain, *, include_entities: bool = True) -> dict[str, Any]:
+    def _task_summary(
+        self,
+        task: TaskChain,
+        *,
+        include_entities: bool = True,
+        include_recent_records: bool = True,
+        text_limit: int | None = None,
+    ) -> dict[str, Any]:
         recent_nodes = sorted(task.nodes.values(), key=lambda item: item.position, reverse=True)[:3]
         summary = {
             "task_id": task.task_id,
-            "task_description": task.task_description,
+            "task_description": _short_text(
+                task.canonical_description or task.task_description,
+                text_limit,
+            ) if text_limit else task.canonical_description or task.task_description,
             "status": task.status.value,
-            "recent_records": [
+            "current_focus": _short_text(task.current_focus, text_limit or 256),
+        }
+        child_tasks = []
+        for child_id in task.child_task_ids:
+            child = self.tasks.get(child_id)
+            if child is None or child.status is not TaskStatus.ACTIVE:
+                continue
+            child_tasks.append(
+                {
+                    "task_id": child.task_id,
+                    "canonical_description": _short_text(
+                        child.canonical_description or child.task_description,
+                        min(text_limit or 256, 256),
+                    ),
+                    "current_focus": _short_text(child.current_focus, 256),
+                    "status": child.status.value,
+                }
+            )
+            if len(child_tasks) >= 8:
+                break
+        summary["child_tasks"] = child_tasks
+        if include_entities:
+            entities = task.entities[: self.router_entity_limit]
+            summary["entities"] = [_short_text(entity, 64) for entity in entities] if text_limit else entities
+        if include_recent_records:
+            summary["parent_task_id"] = task.parent_task_id
+            summary["parent_branch_id"] = task.parent_branch_id
+            summary["child_task_ids"] = list(task.child_task_ids)[:8]
+            summary["branches"] = self.task_routing_profile(task)["branches"][:8]
+            summary["recent_records"] = [
                 {
                     "source_record_id": node.source_record_id,
                     "user_content": node.user_content,
                     "assistant_content": node.assistant_content,
                 }
                 for node in recent_nodes
-            ],
-        }
-        if include_entities:
-            summary["entities"] = task.entities[: self.router_entity_limit]
+            ]
+        else:
+            latest_summary = next((node.summary for node in recent_nodes if node.summary), "")
+            branch_profiles = self.task_routing_profile(task)["branches"]
+            summary["current_focus"] = _short_text(
+                task.current_focus,
+                min(text_limit or self.query_router_summary_limit, 256),
+            )
+            summary["routing_summary"] = _short_text(
+                latest_summary or task.task_description,
+                min(text_limit or self.query_router_summary_limit, 256),
+            )
+            summary["record_count"] = len(task.record_ids)
+            summary["updated_at"] = task.updated_at or task.created_at
+            summary["parent_task_id"] = task.parent_task_id
+            summary["parent_branch_id"] = task.parent_branch_id
+            summary["child_task_ids"] = list(task.child_task_ids)[:8]
+            summary["branches"] = branch_profiles[:8]
         return summary
+
+    def _query_routing_candidates(
+        self,
+        query: str,
+        intent: IntentUnderstanding,
+    ) -> list[TaskChain]:
+        if len(self.tasks) <= self.query_router_pool_size:
+            candidates: list[TaskChain] = []
+            seen_task_ids: set[str] = set()
+            for task in self.tasks.values():
+                if task.task_id in seen_task_ids:
+                    continue
+                seen_task_ids.add(task.task_id)
+                candidates.append(task)
+            return candidates
+        query_tokens = _routing_tokens(
+            [
+                query,
+                intent.main_intent,
+                intent.summary,
+                intent.topic_hint,
+                *intent.key_entities,
+            ]
+        )
+        query_entities = {str(entity).casefold() for entity in intent.key_entities if str(entity).strip()}
+        scored: list[tuple[tuple[int, int, int, str, str], TaskChain]] = []
+        seen_task_ids: set[str] = set()
+        for task in self.tasks.values():
+            if task.task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task.task_id)
+            task_tokens = _routing_tokens(
+                [
+                    task.canonical_description or task.task_description,
+                    task.current_focus,
+                    *task.entities,
+                    *[
+                        part
+                        for branch in task.branches.values()
+                        for part in (branch.branch_goal, branch.current_focus)
+                    ],
+                ]
+            )
+            task_entities = {str(entity).casefold() for entity in task.entities if str(entity).strip()}
+            entity_overlap = len(query_entities & task_entities)
+            token_overlap = len(query_tokens & task_tokens)
+            active_bonus = int(task.status is TaskStatus.ACTIVE)
+            scored.append(
+                (
+                    (
+                        entity_overlap,
+                        token_overlap,
+                        active_bonus,
+                        task.updated_at or task.created_at or "",
+                        task.task_id,
+                    ),
+                    task,
+                )
+            )
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [task for _score, task in scored[: self.query_router_pool_size]]
 
     def _record_intent_bundle(
         self,
@@ -964,7 +1930,25 @@ class TaskChainManager:
             task_description = str(spec.get("task_description", "") or "").strip()
             if not task_description:
                 continue
-            new_tasks.append({"task_description": task_description})
+            normalized_spec: dict[str, Any] = {"task_description": task_description}
+            for key in (
+                "canonical_description",
+                "current_focus",
+                "branch_goal",
+                "branch_id",
+            ):
+                value = str(spec.get(key, "") or "").strip()
+                if value:
+                    normalized_spec[key] = value
+            parent_task_id = str(spec.get("parent_task_id", "") or "").strip()
+            if parent_task_id and parent_task_id in self.tasks:
+                normalized_spec["parent_task_id"] = parent_task_id
+                parent_branch_id = str(spec.get("parent_branch_id", "") or "").strip()
+                if parent_branch_id:
+                    self._ensure_legacy_branch_registry(self.tasks[parent_task_id])
+                    if parent_branch_id in self.tasks[parent_task_id].branches:
+                        normalized_spec["parent_branch_id"] = parent_branch_id
+            new_tasks.append(normalized_spec)
         return {
             "linked_task_ids": linked_task_ids,
             "new_tasks": new_tasks,
@@ -1015,14 +1999,63 @@ class TaskChainManager:
             parsed = _unwrap_schema_response(parsed, expected_keys={"linked_task_ids", "new_tasks"})
         if not isinstance(parsed, dict):
             raise RuntimeError(f"LLM task routing review returned invalid payload for record {record.record_id}")
-        merged = dict(initial_decision)
-        merged.update(parsed)
+        initial_route = self._route_payload_from_parsed(initial_decision)
+        reviewed_route = self._route_payload_from_parsed(parsed)
+        merged = dict(initial_route)
+        for key in ("main_intent", "confidence", "reason"):
+            if key in parsed:
+                merged[key] = parsed[key]
         parsed_has_route = bool(parsed.get("linked_task_ids")) or bool(parsed.get("new_tasks"))
-        if "linked_task_ids" not in parsed or (not parsed_has_route and initial_decision.get("linked_task_ids")):
-            merged["linked_task_ids"] = list(initial_decision.get("linked_task_ids", []) or [])
-        if "new_tasks" not in parsed or (not parsed_has_route and initial_decision.get("new_tasks")):
-            merged["new_tasks"] = list(initial_decision.get("new_tasks", []) or [])
+        if "linked_task_ids" in parsed and parsed_has_route:
+            merged["linked_task_ids"] = reviewed_route["linked_task_ids"]
+        if "new_tasks" in parsed and parsed_has_route:
+            if reviewed_route["new_tasks"]:
+                merged["new_tasks"] = self._merge_review_new_tasks(
+                    initial_route["new_tasks"], reviewed_route["new_tasks"]
+                )
+            elif not initial_route["new_tasks"]:
+                merged["new_tasks"] = []
+        if "linked_task_ids" not in parsed or (not parsed_has_route and initial_route["linked_task_ids"]):
+            merged["linked_task_ids"] = list(initial_route["linked_task_ids"])
+        if "new_tasks" not in parsed or (not parsed_has_route and initial_route["new_tasks"]):
+            merged["new_tasks"] = list(initial_route["new_tasks"])
         return self._route_payload_from_parsed(merged)
+
+    def _merge_review_new_tasks(
+        self,
+        initial_specs: list[dict[str, Any]],
+        reviewed_specs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Preserve draft metadata when review output is intentionally compact."""
+        merged_specs: list[dict[str, Any]] = []
+        used_initial: set[int] = set()
+        for index, reviewed in enumerate(reviewed_specs):
+            match_index: int | None = None
+            for candidate_index, initial in enumerate(initial_specs):
+                if candidate_index in used_initial:
+                    continue
+                matching_keys = (
+                    "parent_task_id",
+                    "parent_branch_id",
+                    "canonical_description",
+                    "task_description",
+                )
+                if any(
+                    initial.get(key)
+                    and reviewed.get(key)
+                    and initial.get(key) == reviewed.get(key)
+                    for key in matching_keys
+                ):
+                    match_index = candidate_index
+                    break
+            if match_index is None and index < len(initial_specs) and index not in used_initial:
+                match_index = index
+            base = dict(initial_specs[match_index]) if match_index is not None else {}
+            if match_index is not None:
+                used_initial.add(match_index)
+            base.update(reviewed)
+            merged_specs.append(base)
+        return merged_specs
 
     def _maybe_refresh_task_metadata(self, task: TaskChain) -> None:
         interval = int(self.task_metadata_refresh_interval or 0)
@@ -1030,8 +2063,13 @@ class TaskChainManager:
             return
         self.refresh_task_metadata(task)
 
-    def refresh_task_metadata(self, task: TaskChain) -> None:
-        payload = {"task": self._task_refresh_payload(task)}
+    def refresh_task_metadata(self, task: TaskChain, *, branch_id: str | None = None) -> None:
+        self._ensure_legacy_branch_registry(task)
+        resolved_branch_id = str(branch_id or task.preferred_branch_id or task.active_branch_id or "main")
+        branch = task.branches.get(resolved_branch_id)
+        if branch is None:
+            raise KeyError(f"unknown branch_id {resolved_branch_id!r} for task {task.task_id}")
+        payload = {"task": self._task_refresh_payload(task, branch_id=resolved_branch_id)}
         rendered = self.prompt_registry.render("task_metadata_refresh", payload_json=_json_dumps(payload))
         parsed = self._call_llm_json(
             PromptBundle(
@@ -1044,29 +2082,44 @@ class TaskChainManager:
             parsed = _unwrap_schema_response(parsed, expected_keys={"task_description", "entities"})
         if not isinstance(parsed, dict):
             raise RuntimeError(f"LLM task metadata refresh returned invalid payload for task {task.task_id}")
-        old_task_description = task.task_description
+        old_task_description = task.canonical_description or task.task_description
+        old_current_focus = branch.current_focus
         old_entities = list(task.entities)
-        task_description = str(parsed.get("task_description", "") or "").strip()
-        if task_description:
-            task.task_description = task_description
+        current_focus = str(parsed.get("current_focus", parsed.get("task_description", "")) or "").strip()
+        if current_focus:
+            branch.current_focus = _short_text(current_focus, 256)
+            if resolved_branch_id == task.preferred_branch_id or resolved_branch_id == task.active_branch_id:
+                task.current_focus = branch.current_focus
         if isinstance(parsed.get("entities"), list):
-            task.entities = self._normalize_entities(parsed["entities"])
+            task.entities = self._normalize_entities([*task.entities, *parsed["entities"]])
+        new_task_description = task.canonical_description or task.task_description
         self._log_task_chain_event(
             task.task_id,
             "metadata_refreshed",
             task_id=task.task_id,
             old_task_description=old_task_description,
-            new_task_description=task.task_description,
+            new_task_description=new_task_description,
+            old_current_focus=old_current_focus,
+            new_current_focus=branch.current_focus,
+            branch_id=resolved_branch_id,
             old_entities=old_entities,
             new_entities=list(task.entities),
-            changed=old_task_description != task.task_description or old_entities != task.entities,
+            changed=old_current_focus != branch.current_focus or old_entities != task.entities,
         )
 
-    def _task_refresh_payload(self, task: TaskChain) -> dict[str, Any]:
-        recent_nodes = sorted(task.nodes.values(), key=lambda item: item.position)[-TASK_REFRESH_RECENT_NODE_LIMIT:]
+    def _task_refresh_payload(self, task: TaskChain, *, branch_id: str | None = None) -> dict[str, Any]:
+        resolved_branch_id = str(branch_id or task.preferred_branch_id or task.active_branch_id or "main")
+        branch = task.branches.get(resolved_branch_id)
+        recent_nodes = sorted(
+            [node for node in task.nodes.values() if node.branch_id == resolved_branch_id],
+            key=lambda item: item.position,
+        )[-TASK_REFRESH_RECENT_NODE_LIMIT:]
         return {
             "task_id": task.task_id,
-            "task_description": task.task_description,
+            "branch_id": resolved_branch_id,
+            "branch_goal": branch.branch_goal if branch is not None else "",
+            "task_description": task.canonical_description or task.task_description,
+            "current_focus": branch.current_focus if branch is not None else task.current_focus,
             "status": task.status.value,
             "entities": task.entities[: self.router_entity_limit],
             "recent_records": [
@@ -1105,8 +2158,14 @@ class TaskChainManager:
     def _task_routing_candidate_key(self, task: TaskChain, record_tokens: set[str]) -> tuple[int, int, str]:
         task_tokens = _routing_tokens(
             [
-                task.task_description,
+                task.canonical_description or task.task_description,
+                task.current_focus,
                 *task.entities,
+                *[
+                    part
+                    for branch in task.branches.values()
+                    for part in (branch.branch_goal, branch.current_focus)
+                ],
             ]
         )
         entity_overlap = len({entity.casefold() for entity in task.entities} & record_tokens)
@@ -1230,10 +2289,14 @@ def _clamp_query_candidate_count(value: int) -> int:
     return min(8, max(3, int(value or DEFAULT_QUERY_ROUTER_CANDIDATE_COUNT)))
 
 
-def _coerce_task_status(value: Any) -> TaskStatus:
+def _coerce_task_status(value: Any, *, strict: bool = False) -> TaskStatus:
+    if isinstance(value, TaskStatus):
+        return value
     try:
         return TaskStatus(str(value or TaskStatus.ACTIVE.value))
     except ValueError:
+        if strict:
+            raise ValueError(f"invalid task status: {value!r}") from None
         return TaskStatus.ACTIVE
 
 
@@ -1280,9 +2343,14 @@ def _is_non_task_route(decision: RouteDecision) -> bool:
 def _routing_tokens(parts: list[str]) -> set[str]:
     tokens: set[str] = set()
     for part in parts:
-        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+._'-]*", str(part or "").casefold()):
+        text = str(part or "").casefold()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+._'-]*", text):
             if len(token) >= 3:
                 tokens.add(token)
+        for chunk in re.findall(r"[\u4e00-\u9fff]+", text):
+            if len(chunk) >= 2:
+                tokens.add(chunk)
+                tokens.update(chunk[index : index + 2] for index in range(len(chunk) - 1))
     return tokens
 
 

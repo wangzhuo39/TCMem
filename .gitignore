@@ -5,3 +5,7 @@ __pycache__/
 data/
 logs/
 vector_db/
+.llm_runtime_openlux/
+.llm_runtime_qwen/
+.codegraph/
+result/

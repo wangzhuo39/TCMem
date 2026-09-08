@@ -9,6 +9,7 @@ from .models import (
     RetrievalResult,
     SearchHit,
     SessionPayload,
+    TaskBranch,
     TaskStatus,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     "RetrievalResult",
     "SearchHit",
     "SessionPayload",
+    "TaskBranch",
     "TCMemConfig",
     "TaskStatus",
 ]

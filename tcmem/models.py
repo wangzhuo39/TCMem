@@ -18,6 +18,7 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
+    MERGED = "merged"
 
 
 @dataclass(slots=True)
@@ -119,6 +120,30 @@ class TaskChainNode:
 
 
 @dataclass(slots=True)
+class TaskBranch:
+    """A maintained route inside one root task.
+
+    Nodes remain the immutable evidence units.  This object stores the
+    branch-level goal, focus, lifecycle and head so routing does not need to
+    infer branch state from the latest node alone.
+    """
+
+    branch_id: str
+    task_id: str
+    branch_goal: str = ""
+    current_focus: str = ""
+    status: TaskStatus = TaskStatus.ACTIVE
+    head_node_id: str | None = None
+    parent_node_id: str | None = None
+    child_task_ids: list[str] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+    last_activity_at: str = ""
+    merged_into_branch_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class TaskChain:
     task_id: str
     task_description: str
@@ -133,6 +158,13 @@ class TaskChain:
     next_node_index: int = 1
     next_branch_index: int = 1
     active_branch_id: str = "main"
+    canonical_description: str = ""
+    current_focus: str = ""
+    branches: dict[str, TaskBranch] = field(default_factory=dict)
+    parent_task_id: str | None = None
+    parent_branch_id: str | None = None
+    child_task_ids: list[str] = field(default_factory=list)
+    preferred_branch_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -195,6 +227,9 @@ class SearchHit:
     source_record_id: str | None = None
     chain_node_id: str | None = None
     bm25_score: float = 0.0
+    route_role: str = "unrouted"
+    route_relation: str | None = None
+    route_depth: int = 0
 
 
 @dataclass(slots=True)
@@ -206,6 +241,8 @@ class RetrievalResult:
     explanation: str = ""
     query_intent: IntentUnderstanding | None = None
     query_route_reason: str = ""
+    expanded_task_ids: list[str] = field(default_factory=list)
+    expansion_edges: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

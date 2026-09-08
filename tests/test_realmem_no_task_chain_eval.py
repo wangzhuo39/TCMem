@@ -152,6 +152,11 @@ class RealMemNoTaskChainEvalTest(unittest.TestCase):
 
         self.assertEqual(options.mode, "tcmem_no_task_chain_online")
         self.assertFalse(options.task_chain_enabled)
+        self.assertEqual(options.ablation_design["llm_usage"]["ingest"], ["entity_extraction"])
+        self.assertEqual(options.ablation_design["llm_usage"]["retrieval"], [])
+        self.assertIn("query_before_ingest", options.ablation_design["online_order"])
+        self.assertIn("vector_bm25_graph_walk", options.ablation_design["retrieval_flow"])
+        self.assertEqual(options.run_name_prefix, "tcmem_realmem_no_task_chain")
 
     def test_render_report_includes_mode(self):
         report = realmem_top_session.render_report(
@@ -168,6 +173,30 @@ class RealMemNoTaskChainEvalTest(unittest.TestCase):
         )
 
         self.assertIn("- mode: tcmem_no_task_chain_online", report)
+
+    def test_render_report_includes_no_task_chain_ablation_design(self):
+        from tcmem.evals import realmem_no_task_chain
+
+        options = realmem_no_task_chain.evaluation_options_from_args(realmem_no_task_chain.parse_args([]))
+        report = realmem_top_session.render_report(
+            run_config={
+                "mode": options.mode,
+                "model": "m",
+                "retrieval_record_k": 1,
+                "session_ks": [1],
+                "with_qa": False,
+                "tcmem_config": {"embedding_model": "e", "vector_index_backend": "numpy"},
+                "ablation_design": options.ablation_design,
+            },
+            dataset_summary={"person_name": "p", "session_count": 1, "query_count": 1, "record_count": 1},
+            metrics_summary={"query_count": 1},
+        )
+
+        self.assertIn("## Ablation Design", report)
+        self.assertIn("query_before_ingest", report)
+        self.assertIn("LLM ingest: entity_extraction", report)
+        self.assertIn("LLM retrieval: none", report)
+        self.assertIn("vector_bm25_graph_walk", report)
 
 
 if __name__ == "__main__":

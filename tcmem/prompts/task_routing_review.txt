@@ -33,6 +33,12 @@ Check whether the draft route matches the record's main intent.
 18. Prioritize `intent.main_intent` when deciding whether the draft route should be kept or corrected.
 19. Prioritize `intent.key_entities` as the strongest evidence when deciding whether the draft route should be kept or corrected.
 20. Treat `intent.topic_hint` as a weak routing hint only, and use `intent.is_substantive` to avoid over-routing low-content records.
+21. Preserve the draft's task metadata unless the record requires a correction.
+22. An independently completable deliverable is a child task and must keep its
+    `parent_task_id`; use `parent_branch_id` only when it names an existing
+    branch under that parent.
+23. `branch_goal` describes a same-root alternative route; `current_focus`
+    describes the work currently being done. Do not use one as the other.
 
 ## Output format
 ```json
@@ -41,7 +47,12 @@ Check whether the draft route matches the record's main intent.
   "linked_task_ids": ["task_id_1"],
   "new_tasks": [
     {
-      "task_description": "..."
+      "task_description": "...",
+      "canonical_description": "...",
+      "current_focus": "...",
+      "parent_task_id": "optional existing task id",
+      "parent_branch_id": "optional existing branch id under parent_task_id",
+      "branch_goal": "optional same-root alternative route"
     }
   ],
   "confidence": 0.8,
@@ -60,7 +71,12 @@ Check whether the draft route matches the record's main intent.
   "linked_task_ids": ["task_id_1"],
   "new_tasks": [
     {
-      "task_description": "..."
+      "task_description": "...",
+      "canonical_description": "...",
+      "current_focus": "...",
+      "parent_task_id": "optional existing task id",
+      "parent_branch_id": "optional existing branch id under parent_task_id",
+      "branch_goal": "optional same-root alternative route"
     }
   ],
   "confidence": 0.8,

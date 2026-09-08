@@ -7,6 +7,9 @@ Route one `current_record` into task chains.
 - `current_record`: the record being routed.
 - `intent`: structured intent understanding for `current_record`.
 - `task_catalog`: candidate task chains that may match.
+  Each candidate includes a stable task description, current focus, branch
+  summaries, and explicit child-task links. Use these fields to preserve the
+  distinction between a root task, a route branch, and an independent child task.
 
 ## Process
 1. Treat the provided `intent` object as the canonical upstream understanding of `current_record`.
@@ -36,15 +39,17 @@ Route one `current_record` into task chains.
 15. Financial analysis and operational risk mitigation are different deliverables.
 16. A goal change, new constraint, reprioritization, correction, refinement, or execution detail inside the same ongoing project should usually stay in the same task, not become a new task.
 17. Do not create a new task for a goal change, new constraint, reprioritization, or execution detail inside the same ongoing project.
-18. If the record mentions options, examples, or background topics, route only the task the user is actively continuing.
-19. If no task exists yet and the record contains a concrete ongoing project, problem, or goal, create a new task.
-20. `reason` must match `main_intent`, `linked_task_ids`, and `new_tasks`.
-21. `confidence` must be a float between 0 and 1.
-22. Use `intent.summary` to understand the current record locally before making any routing decision.
-23. Use `intent.main_intent` to preserve task continuity across records.
-24. Prioritize `intent.main_intent` when comparing `current_record` with `task_catalog`.
-25. Prioritize `intent.key_entities` as the strongest evidence when comparing `current_record` with `task_catalog`.
-26. Treat `intent.topic_hint` as a weak routing hint only, and use `intent.is_substantive` to avoid over-routing greetings or other low-content records.
+18. If the record introduces an independently completable deliverable under an existing task, create one child task with `parent_task_id`; do not create a sibling root task.
+19. Use a branch only for an alternative or conflicting route to the same root goal; branch selection is finalized by conflict resolution after task routing.
+20. If the record mentions options, examples, or background topics, route only the task the user is actively continuing.
+21. If no task exists yet and the record contains a concrete ongoing project, problem, or goal, create a new task.
+22. `reason` must match `main_intent`, `linked_task_ids`, and `new_tasks`.
+23. `confidence` must be a float between 0 and 1.
+24. Use `intent.summary` to understand the current record locally before making any routing decision.
+25. Use `intent.main_intent` to preserve task continuity across records.
+26. Prioritize `intent.main_intent` when comparing `current_record` with `task_catalog`.
+27. Prioritize `intent.key_entities` as the strongest evidence when comparing `current_record` with `task_catalog`.
+28. Treat `intent.topic_hint` as a weak routing hint only, and use `intent.is_substantive` to avoid over-routing greetings or other low-content records.
 
 ## Strong evidence for linking
 - Same concrete objective or deliverable
@@ -61,11 +66,7 @@ Route one `current_record` into task chains.
 {
   "main_intent": "...",
   "linked_task_ids": ["task_id_1"],
-  "new_tasks": [
-    {
-      "task_description": "..."
-    }
-  ],
+  "new_tasks": [{"task_description": "...", "canonical_description": "...", "current_focus": "...", "parent_task_id": "optional", "parent_branch_id": "optional", "branch_goal": "optional"}],
   "confidence": 0.8,
   "reason": "Cite the concrete current-record evidence for the chosen route."
 }
@@ -82,7 +83,12 @@ Route one `current_record` into task chains.
   "linked_task_ids": ["task_id_1"],
   "new_tasks": [
     {
-      "task_description": "..."
+      "task_description": "...",
+      "canonical_description": "...",
+      "current_focus": "...",
+      "parent_task_id": "optional existing task id",
+      "parent_branch_id": "optional existing branch id under parent_task_id",
+      "branch_goal": "optional same-root alternative route"
     }
   ],
   "confidence": 0.8,

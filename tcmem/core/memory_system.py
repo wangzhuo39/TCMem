@@ -46,6 +46,8 @@ class MemorySystem:
             task_metadata_refresh_interval=self.config.task_metadata_refresh_interval,
             router_entity_limit=self.config.task_router_entity_limit,
             query_router_candidate_count=self.config.query_router_candidate_count,
+            query_router_pool_size=self.config.query_router_pool_size,
+            query_router_summary_limit=self.config.query_router_summary_limit,
             prompt_registry=self.prompt_registry,
         )
         if self.task_manager.llm_client is None:
@@ -55,6 +57,11 @@ class MemorySystem:
         self.task_manager.task_metadata_refresh_interval = self.config.task_metadata_refresh_interval
         self.task_manager.router_entity_limit = self.config.task_router_entity_limit
         self.task_manager.query_router_candidate_count = self.config.query_router_candidate_count
+        self.task_manager.query_router_pool_size = max(
+            self.config.query_router_candidate_count,
+            self.config.query_router_pool_size,
+        )
+        self.task_manager.query_router_summary_limit = self.config.query_router_summary_limit
         if self.config.prompt_path:
             self.task_manager.prompt_registry = self.prompt_registry
         self.embedding_client = embedding_client or EmbeddingClient(self.config)
@@ -104,24 +111,15 @@ class MemorySystem:
         buffer = self.pending_route_buffers[record.session_uuid]
         if not buffer:
             buffer.append(record)
-            routed_task_ids: list[str] = []
         elif self._within_routing_window(buffer[-1], record):
             buffer.append(record)
-            routed_task_ids = []
         else:
-            route_decisions, _updates = self._route_and_apply_buffer(record.session_uuid, list(buffer))
-            routed_task_ids = route_decisions[-1].routed_task_ids if route_decisions else []
+            buffered_records = list(buffer)
+            route_decisions, _updates = self._route_and_apply_buffer(record.session_uuid, buffered_records)
+            self._log_ingestion_routes(buffered_records, route_decisions)
             buffer.clear()
             buffer.append(record)
             self.retrieval.sync_record_index()
-
-        self.log_store.log(
-            "ingestion",
-            "record_ingested",
-            record_id=record.record_id,
-            session_uuid=record.session_uuid,
-            routed_task_ids=routed_task_ids,
-        )
         return record
 
     def retrieve(self, query: str, *, top_k: int = 10) -> RetrievalResult:
@@ -133,6 +131,8 @@ class MemorySystem:
             "query_retrieved",
             query=query,
             routed_task_ids=result.routed_task_ids,
+            expanded_task_ids=result.expanded_task_ids,
+            expansion_edges=result.expansion_edges,
             query_intent=to_primitive(result.query_intent),
             query_route_reason=result.query_route_reason,
             hits=to_primitive(result.hits),
@@ -178,6 +178,8 @@ class MemorySystem:
             task_metadata_refresh_interval=loaded_config.task_metadata_refresh_interval,
             router_entity_limit=loaded_config.task_router_entity_limit,
             query_router_candidate_count=loaded_config.query_router_candidate_count,
+            query_router_pool_size=loaded_config.query_router_pool_size,
+            query_router_summary_limit=loaded_config.query_router_summary_limit,
             prompt_registry=PromptRegistry.load(loaded_config.prompt_path),
         )
         return cls(
@@ -224,10 +226,28 @@ class MemorySystem:
         buffer = self.pending_route_buffers.get(session_uuid, [])
         if not buffer:
             return [], []
-        route_decisions, updates = self._route_and_apply_buffer(session_uuid, list(buffer))
+        buffered_records = list(buffer)
+        route_decisions, updates = self._route_and_apply_buffer(session_uuid, buffered_records)
         buffer.clear()
+        self._log_ingestion_routes(buffered_records, route_decisions)
         self.retrieval.sync_record_index()
         return route_decisions, updates
+
+    def _log_ingestion_routes(
+        self,
+        buffered_records: list[DialogueRecord],
+        route_decisions: list[RouteDecision],
+    ) -> None:
+        if len(buffered_records) != len(route_decisions):
+            raise RuntimeError("Routing decisions must correspond to buffered records")
+        for record, route_decision in zip(buffered_records, route_decisions):
+            self.log_store.log(
+                "ingestion",
+                "record_ingested",
+                record_id=record.record_id,
+                session_uuid=record.session_uuid,
+                routed_task_ids=route_decision.routed_task_ids,
+            )
 
     def _route_and_apply_buffer(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -28,6 +29,8 @@ class RuntimeConfig:
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-v4-flash"
+    build_model: str = "deepseek-v4-flash"
+    eval_model: str = "deepseek-v4-flash"
     timeout: int = 120
 
 
@@ -35,6 +38,8 @@ class RuntimeConfig:
 class EvaluationOptions:
     mode: str = "tcmem_top_session"
     task_chain_enabled: bool = True
+    ablation_design: dict[str, Any] = field(default_factory=dict)
+    run_name_prefix: str = "tcmem_realmem_top_session"
 
 
 @dataclass(slots=True)
@@ -62,19 +67,45 @@ class PairRecord:
 
 
 def resolve_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
-    config_path = Path(args.config)
-    if not config_path.exists() and str(args.config) == "zhuo/runtime_config.json":
+    config_value = getattr(args, "config", "zhuo/runtime_config.json")
+    config_path = Path(config_value)
+    if not config_path.exists() and str(config_value) == "zhuo/runtime_config.json":
         fallback = Path("..") / "zhuo" / "runtime_config.json"
         if fallback.exists():
             config_path = fallback
     data: dict[str, Any] = {}
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
+    model = (
+        getattr(args, "model", None)
+        or data.get("model")
+        or os.getenv("OPENAI_MODEL")
+        or "deepseek-v4-flash"
+    )
     return RuntimeConfig(
-        api_key=args.api_key or data.get("api_key") or "",
-        base_url=args.base_url or data.get("base_url") or "https://api.deepseek.com",
-        model=args.model or data.get("model") or "deepseek-v4-flash",
-        timeout=args.timeout or int(data.get("timeout", 120) or 120),
+        api_key=getattr(args, "api_key", None) or data.get("api_key") or os.getenv("OPENAI_API_KEY") or "",
+        base_url=(
+            getattr(args, "base_url", None)
+            or data.get("base_url")
+            or os.getenv("OPENAI_BASE_URL")
+            or "https://api.deepseek.com"
+        ),
+        model=model,
+        build_model=(
+            getattr(args, "build_model", None)
+            or data.get("build_model")
+            or data.get("graph_model")
+            or os.getenv("OPENAI_BUILD_MODEL")
+            or model
+        ),
+        eval_model=(
+            getattr(args, "eval_model", None)
+            or data.get("eval_model")
+            or data.get("qa_model")
+            or os.getenv("OPENAI_EVAL_MODEL")
+            or model
+        ),
+        timeout=getattr(args, "timeout", None) or int(data.get("timeout", os.getenv("OPENAI_TIMEOUT", 120)) or 120),
     )
 
 
@@ -105,7 +136,7 @@ def build_tcmem_config(
         path_b_weight=args.path_b_weight,
         llm_api_key=runtime.api_key,
         llm_base_url=runtime.base_url,
-        llm_model=runtime.model,
+        llm_model=runtime.build_model,
         llm_timeout=runtime.timeout,
         prompt_path=args.prompt_path,
         task_chain_enabled=task_chain_enabled,
@@ -180,9 +211,12 @@ def extract_query_examples(dataset: dict[str, Any]) -> list[QueryExample]:
             if next_turn.get("speaker") != "Assistant":
                 next_turn = {}
             memory_used = [item for item in (next_turn.get("memory_used") or []) if isinstance(item, dict)]
-            gold_uuids = [str(uuid) for uuid in (next_turn.get("memory_session_uuids") or []) if str(uuid)]
+            # RealMemBench defines answer evidence by the immediate assistant
+            # turn's memory_used list.  memory_session_uuids is only a fallback
+            # for legacy examples that lack item-level evidence.
+            gold_uuids = [str(item.get("session_uuid")) for item in memory_used if item.get("session_uuid")]
             if not gold_uuids:
-                gold_uuids = [str(item.get("session_uuid")) for item in memory_used if item.get("session_uuid")]
+                gold_uuids = [str(uuid) for uuid in (next_turn.get("memory_session_uuids") or []) if str(uuid)]
             gold_memory_text = "\n".join(
                 str(item.get("content", "")).strip()
                 for item in memory_used
@@ -266,8 +300,242 @@ def log_query_result(log_store: ModuleLogStore, event: str, result: dict[str, An
     log_store.log("query_results", event, **result)
 
 
+def log_progress(log_store: ModuleLogStore, output_dir: Path, event: str, **payload: Any) -> None:
+    primitive_payload = to_primitive(payload)
+    log_store.log("progress", event, **primitive_payload)
+    entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "module": "progress",
+        "event": event,
+        "payload": primitive_payload,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = output_dir / "progress.jsonl"
+    with progress_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    dump_json(output_dir / "progress_latest.json", entry)
+
+
 def save_latest_state(system: MemorySystem, output_dir: Path) -> Path:
     return system.save(output_dir / "memory_state_latest.json")
+
+
+def preflight_llm_clients(*clients: OpenAICompatibleLLMClient) -> None:
+    """Fail before a long run if a configured model cannot serve a tiny request."""
+    checked: set[tuple[str, str]] = set()
+    for client in clients:
+        # Test doubles and offline adapters may intentionally implement no
+        # network method; the real OpenAI-compatible client always has one.
+        if not callable(getattr(client, "generate", None)):
+            continue
+        base_url = str(getattr(getattr(client, "client", None), "base_url", ""))
+        key = (base_url, str(getattr(client, "model", "")))
+        if key in checked:
+            continue
+        client.generate(
+            "Reply with OK.",
+            system_prompt="This is a runtime availability check.",
+            temperature=0.0,
+            max_tokens=1,
+        )
+        checked.add(key)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {}
+
+
+def resolve_resume_results_dir(resume_from: str | Path) -> tuple[Path, Path]:
+    source = Path(resume_from)
+    if source.is_file():
+        return source.parent, source
+    if (source / "memory_state_latest.json").exists():
+        return source, source / "memory_state_latest.json"
+    if (source / "results" / "memory_state_latest.json").exists():
+        return source / "results", source / "results" / "memory_state_latest.json"
+    raise ValueError(f"No memory_state_latest.json found under resume path: {source}")
+
+
+def load_resume_query_results(results_dir: Path) -> list[dict[str, Any]]:
+    """Load the latest completed result per query from artifacts or append-only logs."""
+    by_query_id: dict[str, dict[str, Any]] = {}
+    metrics = _read_json_object(results_dir / "metrics_results.json")
+    for result in metrics.get("detailed_results", []) or []:
+        if isinstance(result, dict) and result.get("query_id"):
+            by_query_id[str(result["query_id"])] = result
+
+    candidates: list[Path] = []
+    manifest = _read_json_object(results_dir / "manifest.json")
+    log_dir_text = str(manifest.get("log_dir") or "").strip()
+    if log_dir_text:
+        candidates.append(Path(log_dir_text) / "query_results.jsonl")
+    candidates.extend(results_dir.parent.glob("logs/**/query_results.jsonl"))
+    candidates.extend(results_dir.glob("**/query_results.jsonl"))
+    seen_paths: set[Path] = set()
+    for path in candidates:
+        path = path.resolve()
+        if path in seen_paths or not path.exists():
+            continue
+        seen_paths.add(path)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            payload = entry.get("payload") or {}
+            if entry.get("event") == "query_completed" and isinstance(payload, dict) and payload.get("query_id"):
+                by_query_id[str(payload["query_id"])] = payload
+    return list(by_query_id.values())
+
+
+def validate_resume_prefix(
+    *,
+    pair_records: list[PairRecord],
+    state: dict[str, Any],
+    completed_results: list[dict[str, Any]],
+) -> int:
+    graph_records = (state.get("graph") or {}).get("records") or []
+    state_record_ids = [str(record.get("record_id") or "") for record in graph_records if isinstance(record, dict)]
+    expected_ids = [pair.record.record_id for pair in pair_records]
+    if len(state_record_ids) > len(expected_ids) or state_record_ids != expected_ids[: len(state_record_ids)]:
+        raise ValueError("Resume state is not an exact prefix of the requested dataset records")
+
+    query_prior_record_counts = {
+        pair.query_example.query_id: index - 1
+        for index, pair in enumerate(pair_records, start=1)
+        if pair.query_example is not None
+    }
+    for result in completed_results:
+        query_id = str(result.get("query_id") or "")
+        prior_count = query_prior_record_counts.get(query_id)
+        if prior_count is None:
+            raise ValueError(f"Resume result query is absent from requested dataset: {query_id}")
+        if prior_count > len(state_record_ids):
+            raise ValueError(f"Resume result {query_id} is ahead of the saved memory state")
+    return len(state_record_ids)
+
+
+def checkpoint_result_artifacts(
+    *,
+    output_dir: Path,
+    retrieval_results: dict[str, Any],
+    generation_results: dict[str, Any],
+    session_task_chain_results: dict[str, Any],
+    detailed_results: list[dict[str, Any]],
+    session_ks: list[int],
+    status: str = "running",
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = summarize_metrics(detailed_results, session_ks)
+    dump_json(output_dir / "retrieval_results.json", retrieval_results)
+    dump_json(output_dir / "realmem_official_retrieval_results.json", realmem_official_results_from_detailed(detailed_results))
+    dump_json(output_dir / "generation_results.json", generation_results)
+    dump_json(output_dir / "session_task_chain_trace.json", session_task_chain_results)
+    dump_json(
+        output_dir / "metrics_results.json",
+        {"status": status, "summary": summary, "detailed_results": detailed_results},
+    )
+
+
+def write_invalid_run_artifacts(
+    *,
+    output_dir: Path,
+    log_store: ModuleLogStore,
+    run_name: str,
+    dataset_path: Path,
+    run_config: dict[str, Any],
+    summary: dict[str, Any],
+    processed_records: int,
+    total_records: int,
+    evaluated_queries: int,
+    total_queries: int,
+    error: BaseException,
+    error_stage: str,
+) -> dict[str, Any]:
+    """Persist an invalid-run marker without flushing or saving MemorySystem state."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    error_payload = {
+        "stage": error_stage,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "processed_records": processed_records,
+        "total_records": total_records,
+        "evaluated_queries": evaluated_queries,
+        "total_queries": total_queries,
+    }
+    paths = {
+        "manifest": output_dir / "manifest.json",
+        "retrieval": output_dir / "retrieval_results.json",
+        "generation": output_dir / "generation_results.json",
+        "session_task_chain_trace": output_dir / "session_task_chain_trace.json",
+        "metrics": output_dir / "metrics_results.json",
+        "report": output_dir / "realmem_top_session_report.md",
+        "progress": output_dir / "progress.jsonl",
+        "progress_latest": output_dir / "progress_latest.json",
+    }
+    # Successful-query artifacts are checkpointed eagerly.  Never destroy them
+    # merely because a later record or API request interrupted the run.
+    for key in ("retrieval", "generation", "session_task_chain_trace"):
+        if not paths[key].exists():
+            dump_json(paths[key], {})
+    existing_metrics = _read_json_object(paths["metrics"])
+    dump_json(
+        paths["metrics"],
+        {
+            "status": "invalid",
+            "summary": summary,
+            "error": error_payload,
+            "detailed_results": existing_metrics.get("detailed_results", []),
+        },
+    )
+    paths["report"].write_text(
+        render_report(
+            run_config=run_config,
+            dataset_summary={
+                "record_count": total_records,
+                "query_count": total_queries,
+                "session_count": 0,
+                "person_name": "",
+            },
+            metrics_summary={"status": "invalid", **summary},
+        )
+        + "\n\nRun status: invalid\n"
+        + f"Error stage: {error_stage}\n"
+        + f"Error type: {type(error).__name__}\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": 1,
+        "status": "invalid",
+        "run_name": run_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": str(dataset_path),
+        "log_dir": str(log_store.run_dir),
+        "output_dir": str(output_dir),
+        "config": run_config,
+        "summary": summary,
+        "error": error_payload,
+        "processed_records": processed_records,
+        "evaluated_queries": evaluated_queries,
+        "artifacts": {key: str(path) for key, path in paths.items()},
+    }
+    dump_json(paths["manifest"], manifest)
+    log_store.log("dataset", "run_invalid", **error_payload, output_dir=str(output_dir))
+    log_progress(
+        log_store,
+        output_dir,
+        "run_invalid",
+        processed_records=processed_records,
+        total_records=total_records,
+        evaluated_queries=evaluated_queries,
+        total_queries=total_queries,
+        error_stage=error_stage,
+        error_type=type(error).__name__,
+        message=str(error),
+    )
+    return {"status": "invalid", "manifest": manifest, "summary": summary}
 
 
 def save_query_snapshot(
@@ -370,6 +638,16 @@ def should_save_record_state(processed_records: int, every_records: int) -> bool
     return every_records > 0 and processed_records > 0 and processed_records % every_records == 0
 
 
+def should_print_progress(current: int, total: int, every_records: int) -> bool:
+    if current <= 0:
+        return False
+    if current == 1:
+        return True
+    if total > 0 and current >= total:
+        return True
+    return every_records > 0 and current % every_records == 0
+
+
 def build_session_text_by_uuid(dataset: dict[str, Any]) -> dict[str, str]:
     session_text_by_uuid: dict[str, str] = {}
     for dialogue in dataset.get("dialogues", []) or []:
@@ -415,6 +693,253 @@ def ranked_sessions_from_traces(traces: list[dict[str, Any]]) -> list[dict[str, 
     return ranked
 
 
+def _status_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _task_chain_root(manager: Any, task_id: str) -> tuple[str | None, str, list[str]]:
+    """Resolve a task's root while retaining corruption diagnostics."""
+    tasks = getattr(manager, "tasks", {}) or {}
+    current_id = str(task_id or "").strip()
+    visited: list[str] = []
+    seen: set[str] = set()
+    while current_id:
+        if current_id in seen:
+            return None, "cycle", visited
+        seen.add(current_id)
+        visited.append(current_id)
+        task = tasks.get(current_id)
+        if task is None:
+            return None, "missing_task", visited
+        parent_id = str(getattr(task, "parent_task_id", None) or "").strip()
+        if not parent_id:
+            return current_id, "ok", visited
+        if parent_id not in tasks:
+            return None, "missing_parent", visited
+        current_id = parent_id
+    return None, "missing_task", visited
+
+
+def _build_task_chain_record_index(system: MemorySystem) -> dict[str, list[dict[str, Any]]]:
+    """Index task/branch/node ownership by session UUID for query diagnostics."""
+    graph = getattr(system, "graph", None)
+    records = getattr(graph, "records", {}) or {}
+    manager = getattr(system, "task_manager", None)
+    tasks = getattr(manager, "tasks", {}) or {}
+    index: dict[str, list[dict[str, Any]]] = {}
+    for raw_task_id, task in tasks.items():
+        task_id = str(raw_task_id or getattr(task, "task_id", "")).strip()
+        if not task_id:
+            continue
+        record_ids: list[str] = []
+        for record_id in getattr(task, "record_ids", []) or []:
+            record_ids.append(str(record_id))
+        nodes = getattr(task, "nodes", {}) or {}
+        for node in nodes.values():
+            source_record_id = str(getattr(node, "source_record_id", "") or "").strip()
+            if source_record_id:
+                record_ids.append(source_record_id)
+        task_record_ids = _unique(record_ids)
+        records_by_session: dict[str, list[str]] = {}
+        node_ids_by_record: dict[str, list[str]] = {}
+        branch_ids_by_record: dict[str, list[str]] = {}
+        for record_id in task_record_ids:
+            record = records.get(record_id)
+            if record is None:
+                continue
+            session_uuid = str(getattr(record, "session_uuid", "") or "").strip()
+            if not session_uuid:
+                continue
+            records_by_session.setdefault(session_uuid, []).append(record_id)
+            matching_nodes = [
+                node
+                for node in nodes.values()
+                if str(getattr(node, "source_record_id", "") or "").strip() == record_id
+            ]
+            node_ids_by_record[record_id] = [
+                str(getattr(node, "node_id", "") or "").strip()
+                for node in matching_nodes
+                if str(getattr(node, "node_id", "") or "").strip()
+            ]
+            branch_ids_by_record[record_id] = _unique(
+                [str(getattr(node, "branch_id", "") or "main").strip() for node in matching_nodes]
+            )
+        root_id, chain_integrity, ancestry = _task_chain_root(manager, task_id)
+        branches = getattr(task, "branches", {}) or {}
+        task_description = str(
+            getattr(task, "canonical_description", "")
+            or getattr(task, "task_description", "")
+            or ""
+        ).strip()
+        parent_task_id = str(getattr(task, "parent_task_id", None) or "").strip() or None
+        parent_branch_id = str(getattr(task, "parent_branch_id", None) or "").strip() or None
+        for session_uuid, session_record_ids in records_by_session.items():
+            branch_ids = _unique(
+                branch_id
+                for record_id in session_record_ids
+                for branch_id in branch_ids_by_record.get(record_id, [])
+            )
+            branch_details: list[dict[str, Any]] = []
+            for branch_id in branch_ids:
+                branch = branches.get(branch_id)
+                branch_details.append(
+                    {
+                        "branch_id": branch_id,
+                        "branch_goal": _short(getattr(branch, "branch_goal", "") if branch else "", 260),
+                        "current_focus": _short(getattr(branch, "current_focus", "") if branch else "", 260),
+                        "status": _status_value(getattr(branch, "status", "") if branch else ""),
+                        "head_node_id": getattr(branch, "head_node_id", None) if branch else None,
+                        "parent_node_id": getattr(branch, "parent_node_id", None) if branch else None,
+                        "merged_into_branch_id": getattr(branch, "merged_into_branch_id", None) if branch else None,
+                    }
+                )
+            index.setdefault(session_uuid, []).append(
+                {
+                    "task_id": task_id,
+                    "task_role": "child" if parent_task_id else "root",
+                    "task_description": _short(task_description, 360),
+                    "task_status": _status_value(getattr(task, "status", "")),
+                    "task_current_focus": _short(getattr(task, "current_focus", ""), 260),
+                    "parent_task_id": parent_task_id,
+                    "parent_branch_id": parent_branch_id,
+                    "chain_root_task_id": root_id,
+                    "chain_integrity": chain_integrity,
+                    "ancestry_task_ids": ancestry,
+                    "record_ids": _unique(session_record_ids),
+                    "node_ids": _unique(
+                        node_id
+                        for record_id in session_record_ids
+                        for node_id in node_ids_by_record.get(record_id, [])
+                    ),
+                    "branch_ids": branch_ids,
+                    "branches": branch_details,
+                }
+            )
+    for memberships in index.values():
+        memberships.sort(key=lambda item: (str(item.get("chain_root_task_id") or ""), str(item.get("task_id") or "")))
+    return index
+
+
+def build_session_task_chain_trace(
+    *,
+    system: MemorySystem,
+    gold_session_uuids: list[str],
+    memory_used: list[dict[str, Any]],
+    ranked_sessions: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+    routed_task_ids: list[str] | None = None,
+    expanded_task_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a compact, query-level mapping from evidence sessions to task chains."""
+    gold = _unique([str(value or "").strip() for value in gold_session_uuids])
+    gold_counts: dict[str, int] = {}
+    gold_memory_entries: list[dict[str, Any]] = []
+    for memory_index, item in enumerate(memory_used):
+        if not isinstance(item, dict):
+            continue
+        session_uuid = str(item.get("session_uuid") or "").strip()
+        if not session_uuid:
+            continue
+        gold_counts[session_uuid] = gold_counts.get(session_uuid, 0) + 1
+        gold_memory_entries.append(
+            {
+                "memory_index": memory_index,
+                "session_uuid": session_uuid,
+                "content_excerpt": _short(item.get("content", ""), 220),
+            }
+        )
+
+    traces_by_session: dict[str, list[dict[str, Any]]] = {}
+    for trace in traces:
+        session_uuid = str(trace.get("source_session_uuid") or "").strip()
+        if session_uuid:
+            traces_by_session.setdefault(session_uuid, []).append(trace)
+    ranked_by_session: dict[str, tuple[int, dict[str, Any]]] = {}
+    for rank, item in enumerate(ranked_sessions, start=1):
+        session_uuid = str(item.get("session_uuid") or "").strip()
+        if session_uuid and session_uuid not in ranked_by_session:
+            ranked_by_session[session_uuid] = (rank, item)
+
+    routed_tasks = set(_unique([str(task_id or "").strip() for task_id in (routed_task_ids or [])]))
+    expanded_tasks = set(_unique([str(task_id or "").strip() for task_id in (expanded_task_ids or [])]))
+
+    session_uuids = _unique(gold + [str(item.get("session_uuid") or "").strip() for item in ranked_sessions])
+    record_index = _build_task_chain_record_index(system)
+    session_entries: list[dict[str, Any]] = []
+    for session_uuid in session_uuids:
+        ranked = ranked_by_session.get(session_uuid)
+        session_traces = traces_by_session.get(session_uuid, [])
+        memberships = []
+        for membership in record_index.get(session_uuid, []):
+            item = dict(membership)
+            task_id = str(item.get("task_id") or "")
+            route_traces = [trace for trace in session_traces if str(trace.get("task_id") or "") == task_id]
+            item["route_evidence"] = {
+                "hit_count": len(route_traces),
+                "task_routed": task_id in routed_tasks,
+                "task_expanded": task_id in expanded_tasks,
+                "record_ids": _unique(str(trace.get("source_record_id") or "").strip() for trace in route_traces),
+                "chain_node_ids": _unique(str(trace.get("chain_node_id") or "").strip() for trace in route_traces),
+                "route_roles": _unique(str(trace.get("route_role") or "").strip() for trace in route_traces),
+                "route_relations": _unique(str(trace.get("route_relation") or "").strip() for trace in route_traces),
+                "route_depths": sorted({int(trace.get("route_depth") or 0) for trace in route_traces}),
+                "reasons": _unique(str(trace.get("reason") or "").strip() for trace in route_traces),
+            }
+            memberships.append(item)
+        root_ids = _unique(
+            str(item.get("chain_root_task_id") or "").strip()
+            for item in memberships
+            if item.get("chain_root_task_id")
+        )
+        session_entries.append(
+            {
+                "session_uuid": session_uuid,
+                "is_gold": session_uuid in set(gold),
+                "gold_memory_used_count": gold_counts.get(session_uuid, 0),
+                "retrieved_rank": ranked[0] if ranked else None,
+                "retrieved_score": float(ranked[1].get("score") or 0.0) if ranked else None,
+                "retrieved_record_ids": list(ranked[1].get("record_ids") or []) if ranked else [],
+                "retrieved_record_count": int(ranked[1].get("record_count") or 0) if ranked else 0,
+                "retrieval_hit_count": len(session_traces),
+                "task_chain_memberships": memberships,
+                "chain_root_task_ids": root_ids,
+                "in_any_task_chain": bool(memberships),
+            }
+        )
+
+    gold_entries = [item for item in session_entries if item["is_gold"]]
+    root_sets = [set(item["chain_root_task_ids"]) for item in gold_entries]
+    common_roots = sorted(set.intersection(*root_sets)) if root_sets else []
+    union_roots = sorted(set().union(*root_sets)) if root_sets else []
+    chain_groups = [
+        {
+            "chain_root_task_id": root_id,
+            "gold_session_uuids": [item["session_uuid"] for item in gold_entries if root_id in item["chain_root_task_ids"]],
+        }
+        for root_id in union_roots
+    ]
+    summary = {
+        "gold_session_count": len(gold_entries),
+        "gold_sessions_retrieved_count": sum(1 for item in gold_entries if item["retrieved_rank"] is not None),
+        "gold_sessions_in_any_task_chain_count": sum(1 for item in gold_entries if item["in_any_task_chain"]),
+        "gold_sessions_with_valid_root_count": sum(1 for item in gold_entries if item["chain_root_task_ids"]),
+        "gold_sessions_without_task_chain": [item["session_uuid"] for item in gold_entries if not item["in_any_task_chain"]],
+        "gold_sessions_without_valid_root": [item["session_uuid"] for item in gold_entries if not item["chain_root_task_ids"]],
+        "gold_chain_root_task_ids": union_roots,
+        "gold_sessions_common_root_task_ids": common_roots,
+        "gold_sessions_share_common_root_chain": bool(gold_entries) and bool(common_roots),
+        "gold_sessions_share_one_root_chain": bool(gold_entries) and len(common_roots) == 1,
+        "gold_chain_groups": chain_groups,
+        "retrieved_session_count": len(ranked_sessions),
+        "retrieved_sessions_in_any_task_chain_count": sum(1 for item in session_entries if item["retrieved_rank"] and item["in_any_task_chain"]),
+    }
+    return {
+        "gold_memory_used": gold_memory_entries,
+        "sessions": session_entries,
+        "summary": summary,
+    }
+
+
 def construct_session_evidence(
     *,
     ranked_sessions: list[dict[str, Any]],
@@ -449,6 +974,11 @@ def hit_to_trace(hit: SearchHit, system: MemorySystem, gold_session_uuids: list[
         "chain_score": hit.chain_score,
         "graph_score": hit.graph_score,
         "route_score": hit.route_score,
+        "depth": hit.depth,
+        "bm25_score": hit.bm25_score,
+        "route_role": hit.route_role,
+        "route_relation": hit.route_relation,
+        "route_depth": hit.route_depth,
         "reason": hit.reason,
         "task_id": hit.task_id,
         "chain_node_id": hit.chain_node_id,
@@ -460,6 +990,38 @@ def hit_to_trace(hit: SearchHit, system: MemorySystem, gold_session_uuids: list[
         "content_excerpt": _short(record.combined_content if record else "", 420),
         "matched_gold": bool(record and record.session_uuid in set(gold_session_uuids)),
     }
+
+
+def realmem_official_results_from_detailed(detailed_results: list[dict[str, Any]]) -> dict[str, Any]:
+    official: dict[str, Any] = {}
+    for result in detailed_results:
+        question = str(result.get("question") or "").strip()
+        if not question:
+            continue
+        retrieval_result = result.get("retrieval_result") if isinstance(result.get("retrieval_result"), dict) else {}
+        ranked_items = retrieval_result.get("ranked_items") or []
+        official_items: list[dict[str, Any]] = []
+        seen_chunk_ids: set[str] = set()
+        for rank, item in enumerate([item for item in ranked_items if isinstance(item, dict)], start=1):
+            chunk_id = str(item.get("source_session_identifier") or "").strip()
+            if not chunk_id:
+                continue
+            if chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(chunk_id)
+            official_items.append(
+                {
+                    "res_type": "chunk",
+                    "chunk_id": chunk_id,
+                    "content": str(item.get("content_excerpt") or "").strip(),
+                    "rank": rank,
+                    "score": float(item.get("score") or 0.0),
+                    "source_record_id": str(item.get("source_record_id") or item.get("item_id") or "").strip(),
+                    "source_session_uuid": str(item.get("source_session_uuid") or "").strip(),
+                }
+            )
+        official[question] = {"question": question, "ranked_items": official_items}
+    return official
 
 
 def dedupe_ranked_traces(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -492,6 +1054,15 @@ def evaluate_query_top_session(
     traces = dedupe_ranked_traces(traces_from_retrieval(retrieval, system, example.gold_session_uuids))
     ranked_sessions = ranked_sessions_from_traces(traces)
     ranked_session_uuids = [str(item["session_uuid"]) for item in ranked_sessions]
+    session_task_chain_trace = build_session_task_chain_trace(
+        system=system,
+        gold_session_uuids=example.gold_session_uuids,
+        memory_used=example.memory_used,
+        ranked_sessions=ranked_sessions,
+        traces=traces,
+        routed_task_ids=retrieval.routed_task_ids,
+        expanded_task_ids=retrieval.expanded_task_ids,
+    )
     retrieval_metrics = compute_retrieval_metrics(
         retrieved_session_uuids=ranked_session_uuids,
         gold_session_uuids=example.gold_session_uuids,
@@ -503,6 +1074,9 @@ def evaluate_query_top_session(
         "session_uuid": example.session_uuid,
         "turn_index": example.turn_index,
         "gold_session_uuids": example.gold_session_uuids,
+        "gold_memory_used": session_task_chain_trace["gold_memory_used"],
+        "session_task_chain_trace": session_task_chain_trace["sessions"],
+        "gold_session_task_chain_summary": session_task_chain_trace["summary"],
         "retrieved_session_uuids": ranked_session_uuids,
         "ranked_session_uuids": ranked_session_uuids,
         "ranked_sessions": ranked_sessions,
@@ -514,14 +1088,31 @@ def evaluate_query_top_session(
             "query_id": example.query_id,
             "question": example.question,
             "routed_task_ids": retrieval.routed_task_ids,
+            "expanded_task_ids": retrieval.expanded_task_ids,
+            "expansion_edges": retrieval.expansion_edges,
+            "query_intent": to_primitive(retrieval.query_intent) if retrieval.query_intent else None,
+            "query_route_reason": retrieval.query_route_reason,
             "ranked_items": traces,
             "retrieved_session_uuids": ranked_session_uuids,
             "ranked_session_uuids": ranked_session_uuids,
             "ranked_sessions": ranked_sessions,
             "gold_session_uuids": example.gold_session_uuids,
+            "gold_memory_used": session_task_chain_trace["gold_memory_used"],
+            "session_task_chain_trace": session_task_chain_trace["sessions"],
+            "gold_session_task_chain_summary": session_task_chain_trace["summary"],
             "retrieval_record_k": retrieval_record_k,
         },
     }
+    if log_store is not None:
+        log_store.log(
+            "session_task_chain",
+            "query_session_trace",
+            query_id=example.query_id,
+            question=example.question,
+            gold_memory_used=session_task_chain_trace["gold_memory_used"],
+            session_task_chain_trace=session_task_chain_trace["sessions"],
+            gold_session_task_chain_summary=session_task_chain_trace["summary"],
+        )
     if with_qa:
         if client is None:
             raise RuntimeError("--with-qa requires an API client")
@@ -543,6 +1134,19 @@ def evaluate_query_top_session(
         )
         result["qa_score"] = judge_result["score"]
         result["qa_reason"] = judge_result["reason"]
+        memory_result = judge_memory_metrics(
+            client,
+            question=example.question,
+            groundtruth_memory=example.gold_memory_text,
+            retrieved_memory=evidence_text,
+            log_store=log_store,
+            query_id=example.query_id,
+            prompt_registry=prompt_registry,
+        )
+        result["Mem_recall"] = memory_result["Mem_recall"]
+        result["Mem_helpful_score"] = memory_result["Mem_helpful_score"]
+        result["Mem_hits"] = memory_result["Mem_hits"]
+        result["Mem_helpful_reason"] = memory_result["Mem_helpful_reason"]
         result["generation_result"] = {
             "query_id": example.query_id,
             "question": example.question,
@@ -551,6 +1155,10 @@ def evaluate_query_top_session(
             "ranked_sessions": ranked_sessions[:evidence_top_k],
             "evidence_session_uuids": [item["session_uuid"] for item in ranked_sessions[:evidence_top_k]],
             "model": qa_model_name,
+            "Mem_recall": memory_result["Mem_recall"],
+            "Mem_helpful_score": memory_result["Mem_helpful_score"],
+            "Mem_hits": memory_result["Mem_hits"],
+            "Mem_helpful_reason": memory_result["Mem_helpful_reason"],
         }
     return result
 
@@ -615,6 +1223,50 @@ def judge_qa_score(
     if score not in {0, 1, 2, 3}:
         raise ValueError(f"QA judge score must be 0, 1, 2, or 3; got {score!r}")
     return {"score": score, "reason": str(parsed.get("reason", "") or "")}
+
+
+def judge_memory_metrics(
+    client: OpenAICompatibleLLMClient,
+    *,
+    question: str,
+    groundtruth_memory: str,
+    retrieved_memory: str,
+    log_store: ModuleLogStore | None = None,
+    query_id: str = "",
+    prompt_registry: PromptRegistry | None = None,
+) -> dict[str, Any]:
+    registry = prompt_registry or PromptRegistry.default()
+    rendered = registry.render(
+        "realmem_memory_judge",
+        question=question,
+        groundtruth_memory=groundtruth_memory,
+        retrieved_memory=retrieved_memory,
+    )
+    parsed = _generate_json_with_retries(
+        client,
+        rendered.user_prompt,
+        system_prompt=rendered.system_prompt,
+        temperature=0.0,
+        max_tokens=1200,
+        stage="memory_judge",
+        log_store=log_store,
+        context={"query_id": query_id},
+    )
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Memory judge returned non-object JSON")
+    mem_recall = float(parsed.get("Mem_recall", -1.0))
+    if mem_recall < 0.0 or mem_recall > 1.0:
+        raise ValueError(f"Mem_recall must be between 0 and 1; got {mem_recall!r}")
+    helpful_score = int(parsed.get("Mem_helpful_score", -1))
+    if helpful_score not in {0, 1, 2}:
+        raise ValueError(f"Mem_helpful_score must be 0, 1, or 2; got {helpful_score!r}")
+    hits = parsed.get("Mem_hits") if isinstance(parsed.get("Mem_hits"), list) else []
+    return {
+        "Mem_recall": mem_recall,
+        "Mem_helpful_score": helpful_score,
+        "Mem_hits": [str(item) for item in hits],
+        "Mem_helpful_reason": str(parsed.get("Mem_helpful_reason", "") or ""),
+    }
 
 
 def _prompt_json(payload: Any) -> str:
@@ -704,8 +1356,26 @@ def summarize_metrics(detailed_results: list[dict[str, Any]], ks: list[int]) -> 
     qa_scores = [int(item["qa_score"]) for item in detailed_results if isinstance(item.get("qa_score"), int)]
     summary["average_qa_score"] = round(sum(qa_scores) / len(qa_scores), 4) if qa_scores else None
     summary["qa_score_distribution"] = {str(score): qa_scores.count(score) for score in range(4)}
+    mem_recalls = [
+        float(item["Mem_recall"])
+        for item in detailed_results
+        if isinstance(item.get("Mem_recall"), (int, float))
+    ]
+    mem_helpful_scores = [
+        int(item["Mem_helpful_score"])
+        for item in detailed_results
+        if isinstance(item.get("Mem_helpful_score"), int)
+    ]
+    summary["average_mem_recall"] = round(sum(mem_recalls) / len(mem_recalls), 4) if mem_recalls else None
+    summary["average_mem_helpful_score"] = (
+        round(sum(mem_helpful_scores) / len(mem_helpful_scores), 4) if mem_helpful_scores else None
+    )
+    summary["mem_helpful_score_distribution"] = {
+        str(score): mem_helpful_scores.count(score) for score in range(3)
+    }
     summary["query_count"] = len(detailed_results)
     summary["qa_failed_count"] = sum(1 for item in detailed_results if item.get("qa_score") is None)
+    summary["mem_failed_count"] = sum(1 for item in detailed_results if item.get("mem_error"))
     return summary
 
 
@@ -724,18 +1394,26 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
     session_ks = _parse_ks(args.session_ks)
     retrieval_record_k = args.retrieval_record_k or default_retrieval_record_k(session_ks)
 
-    run_name = args.run_name or f"tcmem_realmem_top_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"{options.run_name_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir = Path(args.output_dir) if args.output_dir else Path("result/results") / run_name
     log_store = ModuleLogStore(base_dir=args.log_dir, run_name=run_name)
     runtime = resolve_runtime_config(args)
     if not runtime.api_key:
         raise SystemExit("Missing API key for TCMem RealMem evaluation.")
-    client = OpenAICompatibleLLMClient(
+    build_client = OpenAICompatibleLLMClient(
         api_key=runtime.api_key,
         base_url=runtime.base_url,
-        model=runtime.model,
+        model=runtime.build_model,
         timeout=runtime.timeout,
     )
+    eval_client = OpenAICompatibleLLMClient(
+        api_key=runtime.api_key,
+        base_url=runtime.base_url,
+        model=runtime.eval_model,
+        timeout=runtime.timeout,
+    )
+    if not getattr(args, "skip_llm_preflight", False):
+        preflight_llm_clients(build_client, eval_client)
     config = build_tcmem_config(
         args,
         output_dir=output_dir,
@@ -743,7 +1421,6 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
         runtime=runtime,
         task_chain_enabled=options.task_chain_enabled,
     )
-    system = MemorySystem(config=config, llm_client=client, log_store=log_store)
     if args.max_queries is not None:
         examples = examples[: args.max_queries]
     example_ids = {example.query_id for example in examples}
@@ -757,6 +1434,8 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
         "dataset": str(dataset_path),
         "base_url": runtime.base_url,
         "model": runtime.model,
+        "build_model": runtime.build_model,
+        "eval_model": runtime.eval_model,
         "session_ks": session_ks,
         "retrieval_record_k": retrieval_record_k,
         "evidence_top_k": args.evidence_top_k,
@@ -765,20 +1444,83 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
         "mode": options.mode,
         "tcmem_config": config.to_dict(),
     }
+    if options.ablation_design:
+        run_config["ablation_design"] = options.ablation_design
+
+    resume_from = getattr(args, "resume_from", None)
+    completed_results: list[dict[str, Any]] = []
+    processed_records = 0
+    if resume_from:
+        resume_results_dir, resume_state_path = resolve_resume_results_dir(resume_from)
+        resume_state = _read_json_object(resume_state_path)
+        completed_results = load_resume_query_results(resume_results_dir)
+        processed_records = validate_resume_prefix(
+            pair_records=pair_records,
+            state=resume_state,
+            completed_results=completed_results,
+        )
+        source_manifest = _read_json_object(resume_results_dir / "manifest.json")
+        source_config = source_manifest.get("config") or {}
+        for key in ("dataset", "mode", "session_ks", "retrieval_record_k", "evidence_top_k", "with_qa"):
+            if key in source_config and source_config.get(key) != run_config.get(key):
+                raise ValueError(
+                    f"Resume config mismatch for {key}: source={source_config.get(key)!r}, current={run_config.get(key)!r}"
+                )
+        system = MemorySystem.load(resume_state_path, config=config, llm_client=build_client)
+        system.log_store = log_store
+        system.task_manager.log_store = log_store
+        system.retrieval.sync_record_index()
+        run_config["resume"] = {
+            "source": str(resume_results_dir),
+            "state_path": str(resume_state_path),
+            "restored_records": processed_records,
+            "restored_queries": len(completed_results),
+        }
+    else:
+        system = MemorySystem(config=config, llm_client=build_client, log_store=log_store)
     log_store.log("dataset", "dataset_loaded", **dataset_summary)
     log_store.log("dataset", "run_config", **run_config)
 
-    retrieval_results: dict[str, Any] = {}
-    generation_results: dict[str, Any] = {}
-    detailed_results: list[dict[str, Any]] = []
-    evaluated = 0
-    failed = 0
+    detailed_results = list(completed_results)
+    retrieval_results = {
+        str(result["query_id"]): result["retrieval_result"]
+        for result in detailed_results
+        if result.get("query_id") and isinstance(result.get("retrieval_result"), dict)
+    }
+    generation_results = {
+        str(result["query_id"]): result["generation_result"]
+        for result in detailed_results
+        if result.get("query_id") and isinstance(result.get("generation_result"), dict)
+    }
+    session_task_chain_results = {
+        str(result["query_id"]): {
+            "query_id": result["query_id"],
+            "question": result.get("question", ""),
+            "gold_memory_used": result.get("gold_memory_used", []),
+            "session_task_chain_trace": result.get("session_task_chain_trace", []),
+            "gold_session_task_chain_summary": result.get("gold_session_task_chain_summary", {}),
+        }
+        for result in detailed_results
+        if result.get("query_id")
+    }
+    completed_query_ids = {str(result.get("query_id")) for result in detailed_results if result.get("query_id")}
+    evaluated = len(detailed_results)
+    failed = sum(1 for result in detailed_results if result.get("error_type"))
     started_at = time.time()
-    processed_records = 0
     current_session_uuid = ""
-    log_store.log(
-        "progress",
-        "run_started",
+    if resume_from:
+        checkpoint_result_artifacts(
+            output_dir=output_dir,
+            retrieval_results=retrieval_results,
+            generation_results=generation_results,
+            session_task_chain_results=session_task_chain_results,
+            detailed_results=detailed_results,
+            session_ks=session_ks,
+        )
+    log_progress(
+        log_store,
+        output_dir,
+        "run_resumed" if resume_from else "run_started",
         processed_records=processed_records,
         total_records=len(pair_records),
         record_progress=0.0,
@@ -787,11 +1529,21 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
         query_progress=0.0,
         elapsed_seconds=0.0,
     )
+    if args.verbose:
+        print(
+            f"[run] mode={options.mode} records={len(pair_records)} queries={len(examples)} "
+            f"retrieval_record_k={retrieval_record_k} evidence_top_k={args.evidence_top_k} "
+            f"output_dir={output_dir}",
+            flush=True,
+        )
     for index, pair in enumerate(pair_records, start=1):
+        if index <= processed_records:
+            continue
         if pair.record.session_uuid != current_session_uuid:
             current_session_uuid = pair.record.session_uuid
-            log_store.log(
-                "progress",
+            log_progress(
+                log_store,
+                output_dir,
                 "session_started",
                 **build_progress_payload(
                     pair=pair,
@@ -802,11 +1554,28 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     elapsed_seconds=time.time() - started_at,
                 ),
             )
+            if args.verbose:
+                print(
+                    f"[session] {pair.session_index + 1}/{len(dataset.get('dialogues', []) or [])} "
+                    f"session_uuid={pair.record.session_uuid} record_index={index}/{len(pair_records)}",
+                    flush=True,
+                )
 
         example = pair.query_example
-        if example is not None and example.query_id in example_ids:
-            log_store.log(
-                "progress",
+        if (
+            example is not None
+            and example.query_id in example_ids
+            and example.query_id not in completed_query_ids
+        ):
+            if args.verbose:
+                print(
+                    f"[query-start] {evaluated + 1}/{len(examples)} {example.query_id} "
+                    f"record_index={index}/{len(pair_records)} elapsed={time.time() - started_at:.1f}s",
+                    flush=True,
+                )
+            log_progress(
+                log_store,
+                output_dir,
                 "query_started",
                 **build_progress_payload(
                     pair=pair,
@@ -820,6 +1589,8 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
             )
             query_snapshot: dict[str, Any] | None = None
             query_state_path: Path | None = None
+            query_snapshot_completed = False
+            query_evaluation_completed = False
             try:
                 query_snapshot = save_query_snapshot(
                     system,
@@ -832,6 +1603,8 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                         "evidence_top_k": args.evidence_top_k,
                         "with_qa": args.with_qa,
                         "model": runtime.model,
+                        "build_model": runtime.build_model,
+                        "eval_model": runtime.eval_model,
                         "base_url": runtime.base_url,
                         "processed_records": processed_records,
                         "evaluated_queries": evaluated,
@@ -839,8 +1612,10 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     },
                 )
                 query_state_path = Path(query_snapshot["memory_state_path"])
-                log_store.log(
-                    "progress",
+                query_snapshot_completed = True
+                log_progress(
+                    log_store,
+                    output_dir,
                     "query_snapshot_saved",
                     **build_progress_payload(
                         pair=pair,
@@ -864,8 +1639,8 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     session_ks=session_ks,
                     session_text_by_uuid=session_text_by_uuid,
                     evidence_top_k=args.evidence_top_k,
-                    client=client,
-                    qa_model_name=runtime.model,
+                    client=eval_client,
+                    qa_model_name=runtime.eval_model,
                     with_qa=args.with_qa,
                     log_store=log_store,
                     prompt_registry=system.prompt_registry,
@@ -881,14 +1656,22 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     result["retrieval_result"]["vector_index_path"] = str(query_snapshot["vector_index_path"])
                 detailed_results.append(result)
                 retrieval_results[example.query_id] = result["retrieval_result"]
+                session_task_chain_results[example.query_id] = {
+                    "query_id": example.query_id,
+                    "question": example.question,
+                    "gold_memory_used": result.get("gold_memory_used", []),
+                    "session_task_chain_trace": result.get("session_task_chain_trace", []),
+                    "gold_session_task_chain_summary": result.get("gold_session_task_chain_summary", {}),
+                }
                 if "generation_result" in result:
                     generation_results[example.query_id] = result["generation_result"]
                 evaluated += 1
                 summary_so_far = summarize_metrics(detailed_results, session_ks)
                 log_query_result(log_store, "query_completed", result)
                 log_store.log("metrics", "cumulative_metrics", query_id=example.query_id, **summary_so_far)
-                log_store.log(
-                    "progress",
+                log_progress(
+                    log_store,
+                    output_dir,
                     "query_evaluated",
                     **build_progress_payload(
                         pair=pair,
@@ -900,15 +1683,49 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                         query_id=example.query_id,
                     ),
                 )
+                query_evaluation_completed = True
+                checkpoint_result_artifacts(
+                    output_dir=output_dir,
+                    retrieval_results=retrieval_results,
+                    generation_results=generation_results,
+                    session_task_chain_results=session_task_chain_results,
+                    detailed_results=detailed_results,
+                    session_ks=session_ks,
+                )
                 save_latest_state(system, output_dir)
                 if args.verbose:
                     elapsed = time.time() - started_at
                     print(f"[query] {evaluated}/{len(examples)} {example.query_id} recall_all@{max(session_ks)}={result['retrieval_metrics'][f'recall_all@{max(session_ks)}']:.1f} elapsed={elapsed:.1f}s", flush=True)
             except Exception as exc:
+                if not query_snapshot_completed:
+                    summary = summarize_metrics(detailed_results, session_ks)
+                    summary["failed_query_count"] = failed
+                    return write_invalid_run_artifacts(
+                        output_dir=output_dir,
+                        log_store=log_store,
+                        run_name=run_name,
+                        dataset_path=dataset_path,
+                        run_config=run_config,
+                        summary=summary,
+                        processed_records=processed_records,
+                        total_records=len(pair_records),
+                        evaluated_queries=evaluated,
+                        total_queries=len(examples),
+                        error=exc,
+                        error_stage="query_snapshot",
+                    )
                 failed += 1
+                failed_trace = build_session_task_chain_trace(
+                    system=system,
+                    gold_session_uuids=example.gold_session_uuids,
+                    memory_used=example.memory_used,
+                    ranked_sessions=[],
+                    traces=[],
+                )
                 log_store.log("errors", "query_failed", query_id=example.query_id, error_type=type(exc).__name__, message=str(exc))
-                log_store.log(
-                    "progress",
+                log_progress(
+                    log_store,
+                    output_dir,
                     "query_failed",
                     **build_progress_payload(
                         pair=pair,
@@ -926,6 +1743,9 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     "query_id": example.query_id,
                     "question": example.question,
                     "gold_session_uuids": example.gold_session_uuids,
+                    "gold_memory_used": failed_trace["gold_memory_used"],
+                    "session_task_chain_trace": failed_trace["sessions"],
+                    "gold_session_task_chain_summary": failed_trace["summary"],
                     "retrieved_session_uuids": [],
                     "ranked_session_uuids": [],
                     "ranked_sessions": [],
@@ -939,6 +1759,15 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                 }
+                session_task_chain_results[example.query_id] = {
+                    "query_id": example.query_id,
+                    "question": example.question,
+                    "gold_memory_used": failed_trace["gold_memory_used"],
+                    "session_task_chain_trace": failed_trace["sessions"],
+                    "gold_session_task_chain_summary": failed_trace["summary"],
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
                 if query_snapshot is not None and query_state_path is not None:
                     failure_result["memory_state_path"] = str(query_state_path)
                     failure_result["query_snapshot_dir"] = str(query_snapshot["snapshot_dir"])
@@ -946,34 +1775,65 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
                     failure_result["vector_index_path"] = str(query_snapshot["vector_index_path"])
                 detailed_results.append(failure_result)
                 log_query_result(log_store, "query_failed", failure_result)
-                save_latest_state(system, output_dir)
                 if args.fail_fast:
                     raise
 
         if args.max_queries is not None and evaluated >= args.max_queries:
             break
-        system.ingest_record(pair.record)
-        processed_records = index
-        if should_save_record_state(processed_records, args.state_save_every_records):
-            save_latest_state(system, output_dir)
-        log_store.log(
-            "progress",
-            "record_ingested",
-            **build_progress_payload(
-                pair=pair,
+        if args.verbose and should_print_progress(index, len(pair_records), args.progress_every_records):
+            print(
+                f"[ingest-start] record={index}/{len(pair_records)} "
+                f"session_uuid={pair.record.session_uuid} record_id={pair.record.record_id} "
+                f"queries={evaluated}/{len(examples)} elapsed={time.time() - started_at:.1f}s",
+                flush=True,
+            )
+        try:
+            system.ingest_record(pair.record)
+            processed_records = index
+            if should_save_record_state(processed_records, args.state_save_every_records):
+                save_latest_state(system, output_dir)
+            log_progress(
+                log_store,
+                output_dir,
+                "record_ingested",
+                **build_progress_payload(
+                    pair=pair,
+                    processed_records=processed_records,
+                    total_records=len(pair_records),
+                    evaluated_queries=evaluated,
+                    total_queries=len(examples),
+                    elapsed_seconds=time.time() - started_at,
+                ),
+            )
+        except Exception as exc:
+            summary = summarize_metrics(detailed_results, session_ks)
+            summary["failed_query_count"] = failed
+            return write_invalid_run_artifacts(
+                output_dir=output_dir,
+                log_store=log_store,
+                run_name=run_name,
+                dataset_path=dataset_path,
+                run_config=run_config,
+                summary=summary,
                 processed_records=processed_records,
                 total_records=len(pair_records),
                 evaluated_queries=evaluated,
                 total_queries=len(examples),
-                elapsed_seconds=time.time() - started_at,
-            ),
-        )
-        if args.verbose and index % 50 == 0:
-            print(f"[ingest] records={index}/{len(pair_records)} queries={evaluated}/{len(examples)}", flush=True)
+                error=exc,
+                error_stage="record_ingestion",
+            )
+        if args.verbose and should_print_progress(index, len(pair_records), args.progress_every_records):
+            print(
+                f"[ingest-done] records={index}/{len(pair_records)} queries={evaluated}/{len(examples)} "
+                f"elapsed={time.time() - started_at:.1f}s",
+                flush=True,
+            )
 
     metrics_summary = summarize_metrics(detailed_results, session_ks)
     metrics_summary["failed_query_count"] = failed
     manifest = {
+        "schema_version": 1,
+        "status": "finished",
         "run_name": run_name,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "dataset": str(dataset_path),
@@ -981,28 +1841,53 @@ def run_evaluation(args: argparse.Namespace, *, options: EvaluationOptions | Non
         "output_dir": str(output_dir),
         "config": run_config,
         "summary": metrics_summary,
+        "processed_records": processed_records,
+        "evaluated_queries": evaluated,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    state_path = system.save(output_dir / "memory_state.json")
-    save_latest_state(system, output_dir)
+    try:
+        state_path = system.save(output_dir / "memory_state.json")
+        save_latest_state(system, output_dir)
+    except Exception as exc:
+        return write_invalid_run_artifacts(
+            output_dir=output_dir,
+            log_store=log_store,
+            run_name=run_name,
+            dataset_path=dataset_path,
+            run_config=run_config,
+            summary=metrics_summary,
+            processed_records=processed_records,
+            total_records=len(pair_records),
+            evaluated_queries=evaluated,
+            total_queries=len(examples),
+            error=exc,
+            error_stage="final_state_save",
+        )
     paths = {
         "manifest": output_dir / "manifest.json",
         "state": state_path,
         "retrieval": output_dir / "retrieval_results.json",
+        "realmem_official_retrieval": output_dir / "realmem_official_retrieval_results.json",
         "generation": output_dir / "generation_results.json",
+        "session_task_chain_trace": output_dir / "session_task_chain_trace.json",
         "metrics": output_dir / "metrics_results.json",
         "report": output_dir / "realmem_top_session_report.md",
+        "progress": output_dir / "progress.jsonl",
+        "progress_latest": output_dir / "progress_latest.json",
     }
     dump_json(paths["retrieval"], retrieval_results)
+    dump_json(paths["realmem_official_retrieval"], realmem_official_results_from_detailed(detailed_results))
     dump_json(paths["generation"], generation_results)
+    dump_json(paths["session_task_chain_trace"], session_task_chain_results)
     dump_json(paths["metrics"], {"summary": metrics_summary, "detailed_results": detailed_results})
     report = render_report(run_config=run_config, dataset_summary=dataset_summary, metrics_summary=metrics_summary)
     paths["report"].write_text(report, encoding="utf-8")
     manifest["artifacts"] = {key: str(path) for key, path in paths.items()}
     dump_json(paths["manifest"], manifest)
     log_store.log("dataset", "run_finished", output_dir=str(output_dir), evaluated_queries=evaluated, failed_queries=failed)
-    log_store.log(
-        "progress",
+    log_progress(
+        log_store,
+        output_dir,
         "run_finished",
         processed_records=processed_records,
         total_records=len(pair_records),
@@ -1037,13 +1922,37 @@ def render_report(*, run_config: dict[str, Any], dataset_summary: dict[str, Any]
         f"- session_ks: {run_config.get('session_ks')}",
         f"- with_qa: {run_config.get('with_qa')}",
         "",
-        "## Metrics",
-        "",
     ]
+    ablation_design = run_config.get("ablation_design")
+    if isinstance(ablation_design, dict) and ablation_design:
+        llm_usage = ablation_design.get("llm_usage") if isinstance(ablation_design.get("llm_usage"), dict) else {}
+        lines.extend(
+            [
+                "## Ablation Design",
+                "",
+                f"- name: {ablation_design.get('name', '')}",
+                f"- online_order: {_format_design_steps(ablation_design.get('online_order'))}",
+                f"- ingest_flow: {_format_design_steps(ablation_design.get('ingest_flow'))}",
+                f"- retrieval_flow: {_format_design_steps(ablation_design.get('retrieval_flow'))}",
+                f"- LLM ingest: {_format_design_steps(llm_usage.get('ingest'))}",
+                f"- LLM retrieval: {_format_design_steps(llm_usage.get('retrieval'))}",
+                f"- disabled_components: {_format_design_steps(ablation_design.get('disabled_components'))}",
+                "",
+            ]
+        )
+    lines.extend(["## Metrics", ""])
     for key, value in metrics_summary.items():
         lines.append(f"- {key}: {value}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _format_design_steps(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "none"
+    if value in (None, ""):
+        return "none"
+    return str(value)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1054,6 +1963,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--build-model", "--graph-model", dest="build_model", default=None)
+    parser.add_argument("--eval-model", "--qa-model", dest="eval_model", default=None)
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--owner-id", default="realmem")
     parser.add_argument("--session-ks", "--ks", dest="session_ks", default="5,10,20")
@@ -1074,7 +1985,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--log-dir", default="result/logs")
     parser.add_argument("--state-save-every-records", type=int, default=10)
+    parser.add_argument("--progress-every-records", type=int, default=1)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Resume from a previous run directory or memory_state_latest.json checkpoint.",
+    )
+    parser.add_argument(
+        "--skip-llm-preflight",
+        action="store_true",
+        help="Skip the tiny model availability request (for offline tests only).",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 

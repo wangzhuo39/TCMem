@@ -202,3 +202,42 @@ realmem_qa_judge:
     2. User-related Memory: {{gold_memory_text}}
     3. Reference Answer: {{reference_answer}}
     4. Candidate Answer: {{candidate_answer}}
+
+realmem_memory_judge:
+  system: ""
+  user: |
+    Your task is to evaluate the consistency between the [retrieved memory] and the [ground-truth memory], and whether the retrieved memory is helpful.
+
+    ### Input Data
+    * <question>: {{question}}
+    * <groundtruth_memory>: {{groundtruth_memory}}
+    * <retrieved_memory>: {{retrieved_memory}}
+
+    ---
+
+    ### Evaluation Dimensions
+    #### 1. Memory Recall
+    Mem_recall: Semantics-aware memory recall calculation (0-1)
+    step1: For each groundtruth_memory, check in sequence whether its semantics are contained in any retrieved_memory.
+    step2: Count how many groundtruth_memory items are covered (hits_cnt).
+    step3: Compute the final recall score as hits_cnt / total number of groundtruth_memory items.
+
+    #### 2. Memory Helpfulness
+    Mem_helpful_score: The helpfulness of the retrieved memory for answering the question
+    Score 0: retrieved_memory contains mutually conflicting or contradictory memories, which not only fail to help answer the question but may also cause confusion.
+    Score 1: retrieved_memory is somewhat helpful for answering the question (can provide partial supporting evidence).
+    Score 2: retrieved_memory is very helpful for answering the question (can provide comprehensive supporting evidence).
+
+    ---
+
+    ### Output Format
+    Please provide your evaluation results using the following structure:
+
+    ```json
+    {
+      "Mem_recall": float,
+      "Mem_helpful_score": int,
+      "Mem_hits": ["..."],
+      "Mem_helpful_reason": "..."
+    }
+    ```

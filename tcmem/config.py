@@ -38,10 +38,15 @@ class TCMemConfig:
     graph_bm25_seed_weight: float = 0.3
     graph_walk_depth: int = 2
     routed_task_score: float = 1.0
+    expanded_child_task_score: float = 0.7
+    expanded_parent_task_score: float = 0.6
+    expanded_branch_child_task_score: float = 0.3
     unrouted_task_score: float = 0.3
     task_metadata_refresh_interval: int = 5
     task_router_entity_limit: int = 20
     query_router_candidate_count: int = 5
+    query_router_pool_size: int = 48
+    query_router_summary_limit: int = 512
     task_chain_enabled: bool = True
     prompt_path: str = ""
 
@@ -72,10 +77,20 @@ class TCMemConfig:
         if self.embedding_backend != "sentence_transformers":
             raise ValueError("Only sentence_transformers embedding backend is currently implemented")
         self.query_router_candidate_count = min(8, max(3, int(self.query_router_candidate_count or 5)))
+        self.query_router_pool_size = max(
+            self.query_router_candidate_count,
+            int(self.query_router_pool_size or 48),
+        )
+        self.query_router_summary_limit = max(128, int(self.query_router_summary_limit or 512))
         self.path_b_bm25_weight = max(0.0, float(self.path_b_bm25_weight or 0.0))
         self.graph_seed_limit = max(0, int(self.graph_seed_limit or 0))
         self.graph_bm25_seed_limit = max(0, int(self.graph_bm25_seed_limit or 0))
         self.graph_walk_depth = max(0, int(self.graph_walk_depth or 0))
+        self.routed_task_score = max(0.0, float(self.routed_task_score or 0.0))
+        self.expanded_child_task_score = max(0.0, float(self.expanded_child_task_score or 0.0))
+        self.expanded_parent_task_score = max(0.0, float(self.expanded_parent_task_score or 0.0))
+        self.expanded_branch_child_task_score = max(0.0, float(self.expanded_branch_child_task_score or 0.0))
+        self.unrouted_task_score = max(0.0, float(self.unrouted_task_score or 0.0))
 
     @property
     def state_path(self) -> Path:

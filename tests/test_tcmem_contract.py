@@ -6,13 +6,14 @@ import re
 
 import numpy as np
 
-from tcmem import DialogueRecord, SearchHit, TCMemConfig
+from tcmem import DialogueRecord, IntentUnderstanding, SearchHit, TCMemConfig
 from tcmem.core.graph_store import DialogueGraphStore
 from tcmem.core.memory_system import MemorySystem
+from tcmem.core.retrieval import RetrievalEngine
 from tcmem.core.task_chain import TaskChainManager, _extract_json_payload
 from tcmem.infrastructure.indices import NumpyVectorIndex, VectorIndexItem
 from tcmem.logging_utils import ModuleLogStore
-from tcmem.models import TaskStatus
+from tcmem.models import RouteDecision, TaskStatus
 from tcmem.prompts import PromptRegistry
 
 
@@ -809,6 +810,61 @@ class TCMemContractTest(unittest.TestCase):
         self.assertIn(routed_task_id, entries[1]["payload"]["routed_task_ids"])
         self.assertEqual(entries[1]["payload"]["reason"], "matched")
 
+    def test_query_routing_uses_prefiltered_compact_catalog(self) -> None:
+        llm = IntentAwareQueryLLMClient()
+        manager = TaskChainManager(
+            owner_id="owner",
+            llm_client=llm,
+            query_router_pool_size=4,
+            query_router_summary_limit=128,
+        )
+        for index in range(10):
+            entity = "alpha" if index == 0 else f"topic_{index}"
+            task = manager.create_task_from_record(
+                self._record(f"seed_{index}", f"{entity} task", entities=[entity]),
+                {"task_description": f"{entity} task description"},
+            )
+            task.task_id = "task_alpha" if index == 0 else f"task_{index}"
+            task.task_description = "alpha " + ("long description " * 200) if index == 0 else task.task_description
+            manager.tasks[task.task_id] = task
+
+        decision = manager.route_for_query("alpha question")
+
+        payload = llm.payloads_by_stage["query_routing"][0]
+        self.assertEqual(len(payload["task_catalog"]), 5)
+        self.assertLess(len(json.dumps(payload, ensure_ascii=False)), 5000)
+        self.assertIn("task_alpha", [task["task_id"] for task in payload["task_catalog"]])
+        self.assertNotIn("recent_records", payload["task_catalog"][0])
+        self.assertLessEqual(len(payload["task_catalog"][0]["task_description"]), 128)
+        self.assertEqual(decision.routed_task_ids, ["task_alpha"])
+
+    def test_query_routing_failure_returns_empty_route_for_path_b_fallback(self) -> None:
+        class FailingQueryRouter(FakeLLMClient):
+            def generate(self, prompt: str, **kwargs) -> str:
+                payload = _prompt_payload(prompt)
+                if "query" in payload and "task_catalog" in payload:
+                    raise RuntimeError("router unavailable")
+                return super().generate(prompt, **kwargs)
+
+        manager = TaskChainManager(owner_id="owner", llm_client=FailingQueryRouter())
+        task = manager.create_task_from_record(
+            self._record("seed", "alpha task", entities=["alpha"]),
+            {"task_description": "Alpha task"},
+        )
+        task.task_id = "task_alpha"
+        manager.tasks = {task.task_id: task}
+
+        decision = manager.route_for_query("alpha question")
+
+        self.assertEqual(decision.routed_task_ids, [])
+        self.assertTrue(decision.reason.startswith("query_router_fallback:"))
+
+    def test_query_router_config_exposes_pool_and_summary_limits(self) -> None:
+        config = TCMemConfig(query_router_pool_size=2, query_router_summary_limit=64)
+
+        self.assertEqual(config.query_router_pool_size, 5)
+        self.assertEqual(config.query_router_summary_limit, 128)
+
     def test_task_routing_runs_second_llm_review_and_logs_reviewed_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
@@ -850,6 +906,45 @@ class TCMemContractTest(unittest.TestCase):
         self.assertEqual(decision.main_intent, "reviewed but cleared route")
         self.assertEqual(len(decision.created_task_ids), 1)
         self.assertEqual(decision.routed_task_ids, decision.created_task_ids)
+
+    def test_task_routing_review_preserves_initial_child_metadata_when_review_is_compact(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient())
+        parent = manager.create_task_from_record(
+            self._record("seed", "root project"),
+            {"task_description": "Root project"},
+        )
+        branch = manager.create_branch(parent.task_id, "Validate the selected route")
+        initial = {
+            "main_intent": "collect evidence",
+            "linked_task_ids": [],
+            "new_tasks": [
+                {
+                    "task_description": "Collect evidence",
+                    "canonical_description": "Collect supporting evidence",
+                    "current_focus": "Gather three sources",
+                    "parent_task_id": parent.task_id,
+                    "parent_branch_id": branch.branch_id,
+                    "branch_goal": "Validate the selected route",
+                }
+            ],
+            "confidence": 0.8,
+            "reason": "draft",
+        }
+        manager._call_llm_json = lambda _bundle: {
+            "main_intent": "reviewed evidence",
+            "linked_task_ids": [],
+            "new_tasks": [{"task_description": "Collect evidence"}],
+            "confidence": 0.9,
+            "reason": "reviewed",
+        }
+
+        reviewed = manager._review_task_route(
+            self._record("rec_review", "collect evidence"),
+            initial,
+            intent=IntentUnderstanding(main_intent="collect evidence"),
+        )
+
+        self.assertEqual(reviewed["new_tasks"], initial["new_tasks"])
 
     def test_task_routing_allows_low_confidence_greeting_to_remain_unrouted(self) -> None:
         llm = ReviewKeepsGreetingUnroutedLLMClient()
@@ -902,6 +997,7 @@ class TCMemContractTest(unittest.TestCase):
                     "action": "branch",
                     "reference_node_id": "rec_2",
                     "branch_id": "",
+                    "branch_goal": "Evaluate the parallel constraint route",
                     "summary": "parallel constraint",
                     "task_description_update": None,
                     "confidence": 1.0,
@@ -942,10 +1038,295 @@ class TCMemContractTest(unittest.TestCase):
         self.assertEqual(branch_node.branch_id, "b1")
         self.assertEqual(task.branch_heads["main"], override_node.node_id)
         self.assertEqual(task.branch_heads["b1"], branch_node.node_id)
+        self.assertEqual(set(task.branches), {"main", "b1"})
+        self.assertEqual(task.branches["b1"].head_node_id, branch_node.node_id)
+        self.assertEqual(task.branches["b1"].parent_node_id, override_node.node_id)
+        self.assertEqual(task.branches["b1"].branch_goal, "Evaluate the parallel constraint route")
+        self.assertEqual(task.preferred_branch_id, "b1")
 
         conflict_payloads = llm.payloads_by_stage["record_conflict_resolution"]
         self.assertEqual(conflict_payloads[1]["recent_context"][0]["record_id"], "rec_1")
         self.assertEqual(conflict_payloads[2]["recent_context"][-1]["record_id"], "rec_2")
+
+    def test_branch_and_child_task_lifecycle_is_explicit_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            manager = TaskChainManager("unit", llm_client=FakeLLMClient(), log_store=log_store, task_metadata_refresh_interval=0)
+            root = manager.create_task_from_record(
+                self._record("seed", "portfolio planning"),
+                {
+                    "task_description": "Define a portfolio weighting strategy",
+                    "current_focus": "Collect requirements",
+                },
+            )
+            root_node = manager.apply_record(root.task_id, self._record("rec_1", "portfolio requirements"))
+
+            branch = manager.create_branch(
+                root.task_id,
+                "Evaluate risk parity",
+                parent_node_id=root_node.chain_node_id,
+                current_focus="Compare volatility assumptions",
+                current_time="2026-05-30 11:00:00",
+            )
+            child = manager.create_child_task(
+                root.task_id,
+                "Collect historical performance data",
+                current_focus="Gather three market regimes",
+                entities=["risk parity", "historical performance"],
+                parent_branch_id=branch.branch_id,
+                current_time="2026-05-30 11:01:00",
+            )
+            manager.update_branch_status(
+                root.task_id,
+                branch.branch_id,
+                TaskStatus.COMPLETED,
+                current_time="2026-05-30 11:02:00",
+            )
+            manager.merge_branches(
+                root.task_id,
+                branch.branch_id,
+                "main",
+                current_time="2026-05-30 11:03:00",
+                reason="risk parity evidence merged into main",
+            )
+
+            task_log = log_store.task_chain_path_for(root.task_id)
+            events = [json.loads(line)["event"] for line in task_log.read_text(encoding="utf-8").splitlines()]
+
+            state = manager.to_state()
+            reloaded = TaskChainManager.from_state(state, llm_client=FakeLLMClient())
+            reloaded_root = reloaded.tasks[root.task_id]
+
+        self.assertEqual(reloaded_root.canonical_description, "Define a portfolio weighting strategy")
+        self.assertEqual(reloaded_root.parent_task_id, None)
+        self.assertIn(child.task_id, reloaded_root.child_task_ids)
+        self.assertIn(branch.branch_id, reloaded_root.branches)
+        self.assertEqual(reloaded_root.branches[branch.branch_id].status, TaskStatus.MERGED)
+        self.assertEqual(reloaded_root.branches[branch.branch_id].merged_into_branch_id, "main")
+        self.assertEqual(reloaded.tasks[child.task_id].parent_task_id, root.task_id)
+        self.assertEqual(reloaded.tasks[child.task_id].parent_branch_id, "main")
+        self.assertNotIn(child.task_id, reloaded_root.branches[branch.branch_id].child_task_ids)
+        self.assertIn(child.task_id, reloaded_root.branches["main"].child_task_ids)
+        self.assertIn("branch_created", events)
+
+    def test_merge_branches_reparents_children_and_rejects_repeated_merge(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=0)
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        source = manager.create_branch(root.task_id, "Source route")
+        target = manager.create_branch(root.task_id, "Target route")
+        child = manager.create_child_task(root.task_id, "Child", parent_branch_id=source.branch_id)
+        manager.merge_branches(root.task_id, source.branch_id, target.branch_id, reason="consolidate")
+        self.assertEqual(child.parent_branch_id, target.branch_id)
+        self.assertIn(child.task_id, root.branches[target.branch_id].child_task_ids)
+        self.assertNotIn(child.task_id, root.branches[source.branch_id].child_task_ids)
+        self.assertIn(child.task_id, root.branches[source.branch_id].metadata["merged_child_task_ids"])
+        with self.assertRaisesRegex(ValueError, "already merged"):
+            manager.merge_branches(root.task_id, source.branch_id, target.branch_id)
+        with self.assertRaisesRegex(ValueError, "merged branch"):
+            manager.merge_branches(root.task_id, target.branch_id, source.branch_id)
+
+    def test_create_branch_does_not_select_until_explicit_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            manager = TaskChainManager("unit", llm_client=FakeLLMClient(), log_store=log_store)
+            root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+            branch = manager.create_branch(root.task_id, "Explore route", current_focus="Explore")
+            self.assertEqual(root.active_branch_id, "main")
+            self.assertEqual(root.preferred_branch_id, "main")
+            manager.select_branch(root.task_id, branch.branch_id, reason="route confirmed")
+            self.assertEqual(root.active_branch_id, branch.branch_id)
+            self.assertEqual(root.preferred_branch_id, branch.branch_id)
+            events = [
+                json.loads(line)["event"]
+                for line in log_store.task_chain_path_for(root.task_id).read_text(encoding="utf-8").splitlines()
+            ]
+        self.assertIn("branch_selected", events)
+
+    def test_from_state_rebuilds_parent_links_from_child_side_legacy_state(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=0)
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        branch = manager.create_branch(root.task_id, "Explore route")
+        child = manager.create_child_task(root.task_id, "Child", parent_branch_id=branch.branch_id)
+        state = manager.to_state()
+        tasks_by_id = {item["task_id"]: item for item in state["tasks"]}
+        tasks_by_id[root.task_id]["child_task_ids"] = ["missing_task"]
+        tasks_by_id[root.task_id].pop("branches", None)
+        tasks_by_id[child.task_id].pop("parent_branch_id", None)
+
+        reloaded = TaskChainManager.from_state(state, llm_client=FakeLLMClient())
+        reloaded_root = reloaded.tasks[root.task_id]
+        self.assertEqual(reloaded_root.child_task_ids, [child.task_id])
+        self.assertIn(child.task_id, reloaded.expand_task_ids([root.task_id]))
+        self.assertIsNone(reloaded.tasks[child.task_id].parent_branch_id)
+
+    def test_from_state_rejects_parent_task_cycles(self) -> None:
+        state = {
+            "owner_id": "unit",
+            "tasks": [
+                {"task_id": "task_a", "task_description": "A", "parent_task_id": "task_b"},
+                {"task_id": "task_b", "task_description": "B", "parent_task_id": "task_a"},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "parent cycle"):
+            TaskChainManager.from_state(state, llm_client=FakeLLMClient())
+
+    def test_validate_hierarchy_rejects_dangling_child_links(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient())
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        root.child_task_ids.append("missing_child")
+        with self.assertRaisesRegex(ValueError, "dangling child"):
+            manager.validate_hierarchy()
+
+    def test_from_state_rejects_wrong_branch_owner(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient())
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        state = manager.to_state()
+        state["tasks"][0]["branches"]["main"]["task_id"] = "task_other"
+        with self.assertRaisesRegex(ValueError, "belongs to"):
+            TaskChainManager.from_state(state, llm_client=FakeLLMClient())
+
+    def test_branch_status_rejects_invalid_and_merged_transitions(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient())
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        with self.assertRaisesRegex(ValueError, "invalid task status"):
+            manager.update_branch_status(root.task_id, "main", "not-a-status")
+        with self.assertRaisesRegex(ValueError, "managed by merge_branches"):
+            manager.update_branch_status(root.task_id, "main", TaskStatus.MERGED)
+
+    def test_child_task_creation_updates_parent_activity_timestamps(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient())
+        seed = self._record("seed", "root")
+        seed.current_time = "2026-01-01 00:00:00"
+        root = manager.create_task_from_record(seed, {"task_description": "Root"})
+        branch = manager.create_branch(root.task_id, "Route", current_time="2026-01-01 00:01:00")
+        child = manager.create_child_task(
+            root.task_id,
+            "Child",
+            parent_branch_id=branch.branch_id,
+            current_time="2026-01-01 00:02:00",
+        )
+        self.assertEqual(root.updated_at, "2026-01-01 00:02:00")
+        self.assertEqual(root.branches[branch.branch_id].last_activity_at, "2026-01-01 00:02:00")
+        self.assertEqual(child.created_at, "2026-01-01 00:02:00")
+
+    def test_branch_metadata_refresh_updates_only_requested_branch(self) -> None:
+        class BranchRefreshLLM:
+            def generate(self, prompt: str, **_kwargs) -> str:
+                payload = _prompt_payload(prompt)
+                branch_id = payload["task"]["branch_id"]
+                return json.dumps({"current_focus": f"refreshed-{branch_id}", "entities": [branch_id]})
+
+        manager = TaskChainManager("unit", llm_client=BranchRefreshLLM())
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        branch = manager.create_branch(root.task_id, "Route", current_focus="route focus")
+        root.current_focus = "main focus"
+        root.preferred_branch_id = "main"
+        manager.refresh_task_metadata(root, branch_id=branch.branch_id)
+        self.assertEqual(root.branches[branch.branch_id].current_focus, f"refreshed-{branch.branch_id}")
+        self.assertEqual(root.current_focus, "main focus")
+
+    def test_task_summary_includes_bounded_active_child_semantics(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), query_router_summary_limit=128)
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        child = manager.create_child_task(root.task_id, "Child deliverable", current_focus="Child focus")
+        summary = manager._task_summary(root, include_recent_records=False, text_limit=128)
+        self.assertEqual(summary["child_tasks"][0]["task_id"], child.task_id)
+        self.assertEqual(summary["child_tasks"][0]["canonical_description"], "Child deliverable")
+        self.assertEqual(summary["child_tasks"][0]["current_focus"], "Child focus")
+
+    def test_from_state_rejects_invalid_status_instead_of_coercing_active(self) -> None:
+        state = {"owner_id": "unit", "tasks": [{"task_id": "task_a", "task_description": "A", "status": "bad"}]}
+        with self.assertRaisesRegex(ValueError, "invalid task status"):
+            TaskChainManager.from_state(state, llm_client=FakeLLMClient())
+
+    def test_expand_task_ids_keeps_primary_order_and_adds_parent_children_with_fixed_budget(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=0)
+        root = manager.create_task_from_record(
+            self._record("seed", "root project"),
+            {"task_description": "Root project"},
+        )
+        child_a = manager.create_child_task(root.task_id, "Child A")
+        child_b = manager.create_child_task(root.task_id, "Child B")
+        grandchild = manager.create_child_task(child_a.task_id, "Grandchild")
+        great_grandchild = manager.create_child_task(grandchild.task_id, "Great-grandchild")
+
+        expanded_from_root = manager.expand_task_ids([root.task_id], max_tasks=10)
+        expanded_from_child = manager.expand_task_ids([child_a.task_id], max_tasks=3)
+        expanded_deep = manager.expand_task_ids([child_a.task_id], max_tasks=10)
+
+        self.assertEqual(
+            expanded_from_root,
+            [root.task_id, child_a.task_id, child_b.task_id, grandchild.task_id, great_grandchild.task_id],
+        )
+        self.assertEqual(expanded_from_child, [child_a.task_id, root.task_id, grandchild.task_id])
+        self.assertEqual(
+            expanded_deep,
+            [child_a.task_id, root.task_id, grandchild.task_id, child_b.task_id, great_grandchild.task_id],
+        )
+        self.assertLessEqual(len(expanded_from_child), 3)
+
+        expanded, edges = manager.expand_task_graph([child_a.task_id], max_tasks=10)
+        self.assertEqual(expanded, expanded_deep)
+        self.assertEqual(
+            edges[:3],
+            [
+                {"from": child_a.task_id, "to": root.task_id, "relation": "parent", "depth": 1},
+                {"from": child_a.task_id, "to": grandchild.task_id, "relation": "child", "depth": 1},
+                {"from": root.task_id, "to": child_b.task_id, "relation": "child", "depth": 2},
+            ],
+        )
+
+    def test_expand_task_graph_limits_siblings_to_same_parent_branch(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=0)
+        root = manager.create_task_from_record(self._record("seed", "root"), {"task_description": "Root"})
+        branch_a = manager.create_branch(root.task_id, "Route A")
+        branch_b = manager.create_branch(root.task_id, "Route B")
+        child_a = manager.create_child_task(root.task_id, "Child A", parent_branch_id=branch_a.branch_id)
+        child_b = manager.create_child_task(root.task_id, "Child B", parent_branch_id=branch_b.branch_id)
+
+        from_root = manager.expand_task_ids([root.task_id], max_tasks=10)
+        from_child = manager.expand_task_ids([child_a.task_id], max_tasks=10)
+        self.assertIn(child_a.task_id, from_root)
+        self.assertIn(child_b.task_id, from_root)
+        self.assertIn(root.task_id, from_child)
+        self.assertIn(child_a.task_id, from_child)
+        self.assertNotIn(child_b.task_id, from_child)
+
+    def test_record_router_preserves_child_task_metadata_fields(self) -> None:
+        manager = TaskChainManager("unit", llm_client=FakeLLMClient(), task_metadata_refresh_interval=0)
+        parent = manager.create_task_from_record(
+            self._record("seed", "root project"),
+            {"task_description": "Root project"},
+        )
+        branch = manager.create_branch(parent.task_id, "Validate the selected route")
+
+        route = manager._route_payload_from_parsed(
+            {
+                "linked_task_ids": [],
+                "new_tasks": [
+                    {
+                        "task_description": "Collect evidence",
+                        "canonical_description": "Collect supporting evidence",
+                        "current_focus": "Gather three sources",
+                        "parent_task_id": parent.task_id,
+                        "parent_branch_id": branch.branch_id,
+                        "branch_goal": "Validate the selected route",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            route["new_tasks"][0],
+            {
+                "task_description": "Collect evidence",
+                "canonical_description": "Collect supporting evidence",
+                "current_focus": "Gather three sources",
+                "parent_task_id": parent.task_id,
+                "parent_branch_id": branch.branch_id,
+                "branch_goal": "Validate the selected route",
+            },
+        )
 
     def test_record_intent_prompt_receives_closed_routing_window_and_routing_prompts_receive_intent(self) -> None:
         llm = ConflictAwareLLMClient(
@@ -1012,6 +1393,57 @@ class TCMemContractTest(unittest.TestCase):
         self.assertEqual([payload["intent"]["main_intent"] for payload in review_payloads], ["continue existing task"] * 2)
         self.assertEqual(len(review_payloads), 2)
 
+    def test_ingestion_log_matches_each_record_when_routing_buffer_flushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
+            system = MemorySystem(
+                config=self._config(tmpdir),
+                embedding_client=FakeEmbeddingClient(),
+                llm_client=FakeLLMClient(),
+                log_store=log_store,
+            )
+
+            def route_buffer(_session_uuid: str, records: list[DialogueRecord]):
+                return (
+                    [
+                        RouteDecision(
+                            linked_task_ids=[],
+                            created_task_ids=[],
+                            routed_task_ids=[f"task_for_{record.record_id}"],
+                            main_intent=record.user_content,
+                            confidence=1.0,
+                            reason="test route",
+                            intent=IntentUnderstanding(main_intent=record.user_content),
+                        )
+                        for record in records
+                    ],
+                    [],
+                )
+
+            system._route_and_apply_buffer = route_buffer
+            system.ingest_record(
+                self._record("rec_1", "first", record_time="2026-05-30 10:00:00")
+            )
+            system.ingest_record(
+                self._record("rec_2", "second", record_time="2026-05-30 10:31:00")
+            )
+            system.flush_all_pending_routes()
+
+            entries = [
+                json.loads(line)
+                for line in log_store.path_for("ingestion").read_text(encoding="utf-8").splitlines()
+                if json.loads(line)["event"] == "record_ingested"
+            ]
+
+        self.assertEqual(
+            {
+                entry["payload"]["record_id"]: entry["payload"]["routed_task_ids"]
+                for entry in entries
+            },
+            {"rec_1": ["task_for_rec_1"], "rec_2": ["task_for_rec_2"]},
+        )
+        self.assertEqual([entry["payload"]["record_id"] for entry in entries], ["rec_1", "rec_2"])
+
     def test_task_chain_manager_logs_metadata_refresh_to_task_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_store = ModuleLogStore(base_dir=tmpdir, run_name="run")
@@ -1037,12 +1469,14 @@ class TCMemContractTest(unittest.TestCase):
         self.assertEqual(refresh_entry["event"], "metadata_refreshed")
         self.assertEqual(refresh_entry["payload"]["task_id"], task.task_id)
         self.assertEqual(refresh_entry["payload"]["old_task_description"], "Alpha task")
-        self.assertEqual(refresh_entry["payload"]["new_task_description"], "Refreshed task")
+        self.assertEqual(refresh_entry["payload"]["new_task_description"], "Alpha task")
+        self.assertEqual(refresh_entry["payload"]["old_current_focus"], "")
+        self.assertEqual(refresh_entry["payload"]["new_current_focus"], "Refreshed task")
         self.assertEqual(refresh_entry["payload"]["old_entities"], ["alpha"])
-        self.assertEqual(refresh_entry["payload"]["new_entities"], ["refreshed"])
+        self.assertEqual(refresh_entry["payload"]["new_entities"], ["alpha", "refreshed"])
         self.assertTrue(refresh_entry["payload"]["changed"])
 
-    def test_conflict_payload_omits_topic_and_applies_task_description_update(self) -> None:
+    def test_conflict_payload_omits_topic_and_applies_task_focus_update(self) -> None:
         llm = ConflictAwareLLMClient(
             [
                 {
@@ -1064,11 +1498,25 @@ class TCMemContractTest(unittest.TestCase):
 
         manager.apply_record(task.task_id, self._record("rec_1", "alpha first"))
 
-        self.assertEqual(task.task_description, "Updated alpha task")
+        self.assertEqual(task.task_description, "Alpha task")
+        self.assertEqual(task.canonical_description, "Alpha task")
+        self.assertEqual(task.current_focus, "Updated alpha task")
         conflict_payload = llm.payloads_by_stage["record_conflict_resolution"][0]
         self.assertNotIn("topic", conflict_payload["task"])
         self.assertEqual(conflict_payload["task"]["status"], "active")
-        self.assertEqual(set(conflict_payload["task"]), {"task_id", "task_description", "status"})
+        self.assertEqual(
+            set(conflict_payload["task"]),
+            {
+                "task_id",
+                "task_description",
+                "current_focus",
+                "status",
+                "parent_task_id",
+                "parent_branch_id",
+                "child_task_ids",
+                "branches",
+            },
+        )
 
     def test_record_conflict_payload_uses_task_scope_record_intent_and_recent_context_intent(self) -> None:
         from tcmem import IntentUnderstanding
@@ -1126,7 +1574,19 @@ class TCMemContractTest(unittest.TestCase):
         )
 
         payload = llm.payloads_by_stage["record_conflict_resolution"][1]
-        self.assertEqual(set(payload["task"]), {"task_id", "task_description", "status"})
+        self.assertEqual(
+            set(payload["task"]),
+            {
+                "task_id",
+                "task_description",
+                "current_focus",
+                "status",
+                "parent_task_id",
+                "parent_branch_id",
+                "child_task_ids",
+                "branches",
+            },
+        )
         self.assertEqual(payload["record"]["summary"], "follow intent summary")
         self.assertEqual(payload["record"]["main_intent"], "continue alpha implementation")
         self.assertEqual(payload["record"]["key_entities"], ["alpha", "beta"])
@@ -1198,7 +1658,7 @@ class TCMemContractTest(unittest.TestCase):
     def test_task_routing_prompt_limits_overbroad_multi_task_links(self) -> None:
         prompt_text = Path("tcmem/prompts/task_routing.txt").read_text(encoding="utf-8")
 
-        self.assertLess(len(prompt_text), 4500)
+        self.assertLess(len(prompt_text), 5200)
         self.assertIn("main_intent", prompt_text)
         self.assertIn("canonical upstream understanding", prompt_text)
         self.assertIn("Default routing should link 1-3 existing tasks", prompt_text)
@@ -1247,6 +1707,7 @@ class TCMemContractTest(unittest.TestCase):
         self.assertIn("If unsure between create and override, choose create", conflict)
         self.assertIn("If unsure between branch and override, choose branch", conflict)
         self.assertIn("If unsure between create and branch, choose create", conflict)
+        self.assertIn('"branch_goal"', conflict)
 
     def test_split_txt_prompt_loads_system_and_user_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1348,6 +1809,27 @@ custom_stage:
         self.assertEqual(positional_hit.bm25_score, 0.0)
         self.assertTrue(config.task_chain_enabled)
 
+    def test_expanded_route_metadata_uses_lower_configured_scores(self) -> None:
+        engine = object.__new__(RetrievalEngine)
+        engine.config = TCMemConfig(
+            routed_task_score=1.0,
+            expanded_child_task_score=0.7,
+            expanded_parent_task_score=0.6,
+            expanded_branch_child_task_score=0.3,
+        )
+        edges = [
+            {"from": "root", "to": "child", "relation": "child", "depth": 1},
+            {"from": "child", "to": "root", "relation": "parent", "depth": 1},
+        ]
+        self.assertEqual(
+            engine._route_metadata("root", {"root"}, {"root", "child"}, edges),
+            ("primary", 1.0, None, 0),
+        )
+        self.assertEqual(
+            engine._route_metadata("child", {"root"}, {"root", "child"}, edges),
+            ("expanded", 0.7, "child", 1),
+        )
+
     def _config(self, tmpdir: str) -> TCMemConfig:
         return TCMemConfig(
             owner_id="unit",
@@ -1448,6 +1930,7 @@ custom_stage:
         self.assertEqual(result.hits[0].source_record_id, "rec_alpha")
         self.assertIn("path_b_vector_bm25_graph", result.hits[0].reason)
         self.assertTrue(result.routed_task_ids)
+        self.assertEqual(result.expanded_task_ids, result.routed_task_ids)
 
     def test_memory_system_no_task_chain_mode_extracts_entities_without_task_routing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1569,11 +2052,13 @@ custom_stage:
         neighbor_hit = next(hit for hit in result.hits if hit.source_record_id == "rec_neighbor")
         self.assertEqual(neighbor_hit.bm25_score, 0.0)
 
-    def test_query_routing_requires_llm_client_without_fallback(self) -> None:
+    def test_query_routing_falls_back_without_llm_client(self) -> None:
         manager = TaskChainManager("unit", llm_client=None)
 
-        with self.assertRaisesRegex(RuntimeError, "LLM client missing for stage query_intent_understanding"):
-            manager.route_for_query("alpha question")
+        decision = manager.route_for_query("alpha question")
+
+        self.assertEqual(decision.routed_task_ids, [])
+        self.assertEqual(decision.reason, "query_router_fallback:RuntimeError")
 
     def test_query_routing_retries_json_decode_error_and_logs_raw_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1749,7 +2234,7 @@ custom_stage:
         self.assertEqual(llm.calls, 2)
         self.assertEqual(entities, [])
 
-    def test_router_task_summary_exposes_status_entities_and_recent_records(self) -> None:
+    def test_router_task_summary_exposes_compact_query_metadata(self) -> None:
         llm = CapturingLLMClient({"routed_task_ids": ["task_manual"], "reason": "matched"})
         manager = TaskChainManager("unit", llm_client=llm)
         record = self._record("rec_alpha", "alpha project decision", entities=[f"e{i}" for i in range(30)])
@@ -1766,15 +2251,29 @@ custom_stage:
         manager.route_for_query("alpha question")
 
         task_summary = llm.payloads[-1]["task_catalog"][0]
-        self.assertEqual(set(task_summary), {"task_id", "task_description", "status", "entities", "recent_records"})
+        self.assertEqual(
+            set(task_summary),
+            {
+                "task_id",
+                "task_description",
+                "status",
+                "entities",
+                "current_focus",
+                "routing_summary",
+                "record_count",
+                "updated_at",
+                "parent_task_id",
+                "parent_branch_id",
+                "child_task_ids",
+                "child_tasks",
+                "branches",
+            },
+        )
         self.assertEqual(task_summary["status"], "active")
         self.assertEqual(task_summary["entities"], [f"e{i}" for i in range(20)])
-        self.assertEqual([item["source_record_id"] for item in task_summary["recent_records"]], ["rec_4", "rec_3", "rec_2"])
-        self.assertEqual(
-            set(task_summary["recent_records"][0]),
-            {"source_record_id", "user_content", "assistant_content"},
-        )
-        self.assertEqual(task_summary["recent_records"][2]["assistant_content"], "assistant second")
+        self.assertEqual(task_summary["record_count"], 4)
+        self.assertEqual(task_summary["routing_summary"], "alpha fourth")
+        self.assertNotIn("recent_records", task_summary)
 
     def test_query_routing_sends_candidate_count_and_limits_returned_ids(self) -> None:
         llm = CapturingLLMClient(
@@ -1847,6 +2346,9 @@ custom_stage:
         self.assertTrue(result.query_intent is not None)
         self.assertEqual(entries[-1]["payload"]["query_intent"]["main_intent"], result.query_intent.main_intent)
         self.assertEqual(entries[-1]["payload"]["query_route_reason"], result.query_route_reason)
+        self.assertEqual(entries[-1]["payload"]["routed_task_ids"], result.routed_task_ids)
+        self.assertEqual(entries[-1]["payload"]["expanded_task_ids"], result.expanded_task_ids)
+        self.assertEqual(entries[-1]["payload"]["expansion_edges"], result.expansion_edges)
 
     def test_docs_describe_intent_aware_routing_flow(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
@@ -1900,8 +2402,21 @@ custom_stage:
 
         routing_task = llm.payloads_by_stage["task_routing"][0]["task_catalog"][0]
         review_task = llm.payloads_by_stage["task_routing_review"][0]["task_catalog"][0]
-        self.assertEqual(set(routing_task), {"task_id", "task_description", "status", "entities", "recent_records"})
-        self.assertEqual(set(review_task), {"task_id", "task_description", "status", "entities", "recent_records"})
+        expected_task_fields = {
+            "task_id",
+            "task_description",
+            "status",
+            "current_focus",
+            "entities",
+            "parent_task_id",
+            "parent_branch_id",
+            "child_task_ids",
+            "child_tasks",
+            "branches",
+            "recent_records",
+        }
+        self.assertEqual(set(routing_task), expected_task_fields)
+        self.assertEqual(set(review_task), expected_task_fields)
         self.assertEqual(routing_task["entities"], ["alpha"])
         self.assertEqual(review_task["entities"], ["alpha"])
 
@@ -2056,7 +2571,9 @@ custom_stage:
 
         manager.apply_record(task.task_id, self._record("rec_2", "alpha second"))
 
-        self.assertEqual(task.task_description, "Refreshed task")
+        self.assertEqual(task.task_description, "Alpha task")
+        self.assertEqual(task.canonical_description, "Alpha task")
+        self.assertEqual(task.current_focus, "Refreshed task")
         self.assertEqual(task.entities, ["refreshed"])
 
     def test_state_round_trip_preserves_task_status_and_ignores_legacy_topic(self) -> None:
