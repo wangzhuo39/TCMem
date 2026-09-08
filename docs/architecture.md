@@ -27,7 +27,14 @@ For retrieval, the query first goes through
 expanded through deterministic parent/child/branch edges. Path A scores chain
 nodes; Path B scores vector and BM25 seeds followed by graph expansion, with
 task context used only in the enabled variant. Both paths are fused at the
-record level before session aggregation.
+record level before session aggregation. Every Path-B hit also keeps its
+unpenalized `generic_score`, while `task_chain_evidence` records whether Path A
+or a primary/expanded route contributed. The raw `SearchHit.score` remains the
+weighted Path-A/Path-B evidence score; online record ordering in Full mode uses
+`score + 0.05 * generic_score` when chain evidence exists and
+`0.5 * generic_score` for generic-only records. Session evaluation applies the
+same rule to the session maxima. In the no-task-chain arm, session ordering is
+the top-three Path-B evidence sum (`1.0`, `0.75`, `0.5`).
 
 ## Fixed online ablation
 

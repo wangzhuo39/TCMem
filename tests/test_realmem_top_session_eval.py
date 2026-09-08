@@ -309,6 +309,47 @@ class RealMemTopSessionEvalTest(unittest.TestCase):
         self.assertEqual(ranked[0]["record_count"], 2)
         self.assertEqual(ranked[0]["record_ids"], ["r1", "r2"])
 
+    def test_ranked_sessions_full_uses_chain_primary_and_generic_fallback(self) -> None:
+        traces = [
+            {
+                "source_record_id": "chain-record",
+                "source_session_uuid": "chain-session",
+                "score": 0.60,
+                "generic_score": 0.80,
+                "task_chain_evidence": True,
+            },
+            {
+                "source_record_id": "generic-record",
+                "source_session_uuid": "generic-session",
+                "score": 0.90,
+                "generic_score": 0.90,
+                "task_chain_evidence": False,
+            },
+        ]
+
+        ranked = ranked_sessions_from_traces(traces, task_chain_enabled=True)
+
+        self.assertEqual([item["session_uuid"] for item in ranked], ["chain-session", "generic-session"])
+        self.assertAlmostEqual(ranked[0]["score"], 0.64)
+        self.assertAlmostEqual(ranked[1]["score"], 0.45)
+        self.assertAlmostEqual(ranked[0]["full_max_score"], 0.60)
+        self.assertAlmostEqual(ranked[0]["generic_max_score"], 0.80)
+        self.assertTrue(ranked[0]["task_chain_evidence"])
+
+    def test_ranked_sessions_no_task_chain_uses_top_three_evidence_sum(self) -> None:
+        traces = [
+            {"source_record_id": "r1", "source_session_uuid": "s", "score": 0.8},
+            {"source_record_id": "r2", "source_session_uuid": "s", "score": 0.6},
+            {"source_record_id": "r3", "source_session_uuid": "s", "score": 0.4},
+            {"source_record_id": "r4", "source_session_uuid": "s", "score": 0.2},
+        ]
+
+        ranked = ranked_sessions_from_traces(traces, task_chain_enabled=False)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertAlmostEqual(ranked[0]["score"], 0.8 + 0.75 * 0.6 + 0.5 * 0.4)
+        self.assertEqual(ranked[0]["record_count"], 4)
+
     def test_metrics_score_top_session_recall(self) -> None:
         metrics = compute_retrieval_metrics(
             retrieved_session_uuids=["s1", "gold"],

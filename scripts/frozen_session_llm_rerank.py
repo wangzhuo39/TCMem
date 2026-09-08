@@ -78,6 +78,7 @@ def build_candidates(
                     "chain_score": 0.0,
                     "route_roles": [],
                     "task_ids": [],
+                    "task_chain_evidence": False,
                     "excerpts": [],
                     "record_scores": [],
                 },
@@ -92,6 +93,10 @@ def build_candidates(
             role = str(item.get("route_role") or "").strip()
             if role and role not in row["route_roles"]:
                 row["route_roles"].append(role)
+            evidence_value = item.get("task_chain_evidence")
+            if evidence_value is None:
+                evidence_value = role in {"primary", "expanded"} or "path_a" in str(item.get("reason") or "")
+            row["task_chain_evidence"] = bool(row["task_chain_evidence"] or evidence_value)
             task_id = str(item.get("task_id") or "").strip()
             if task_id and task_id not in row["task_ids"]:
                 row["task_ids"].append(task_id)
@@ -106,7 +111,6 @@ def build_candidates(
     rows = rows[: max(1, int(limit))]
     for row in rows:
         row["excerpts"] = row["excerpts"][:3]
-        row["task_chain_evidence"] = bool(row["task_ids"] or row["chain_score"] > 0)
     return rows
 
 
@@ -243,18 +247,30 @@ def ndcg(ranked: list[str], gold: list[str], k: int) -> float:
 
 def query_metrics(ranked: list[str], gold: list[str]) -> dict[str, float]:
     result: dict[str, float] = {}
+    gold_set = set(gold)
     for k in KS:
         top = ranked[:k]
-        result[f"recall_any@{k}"] = float(bool(set(top) & set(gold)))
-        result[f"recall_all@{k}"] = sum(sid in top for sid in gold) / len(gold) if gold else 0.0
+        top_set = set(top)
+        result[f"recall_any@{k}"] = float(bool(top_set & gold_set))
+        # Keep the official RealMemBench definition binary: all gold sessions
+        # must be present in the top-k set.  The fractional value is exposed
+        # separately as coverage for backwards-compatible diagnostics.
+        result[f"recall_all@{k}"] = float(gold_set.issubset(top_set)) if gold_set else 0.0
+        result[f"recall_coverage@{k}"] = (
+            sum(sid in top_set for sid in gold_set) / len(gold_set) if gold_set else 0.0
+        )
         result[f"ndcg@{k}"] = ndcg(ranked, gold, k)
     return result
 
 
 def summarize(items: list[dict[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {"query_count": len(items)}
-    for key in [f"{prefix}@{k}" for k in KS for prefix in ("recall_any", "recall_all", "ndcg")]:
-        values = [float(item["metrics"][key]) for item in items]
+    for key in [
+        f"{prefix}@{k}"
+        for k in KS
+        for prefix in ("recall_any", "recall_all", "recall_coverage", "ndcg")
+    ]:
+        values = [float((item.get("metrics") or {}).get(key, 0.0)) for item in items]
         result[key] = round(sum(values) / len(values), 4) if values else 0.0
     return result
 

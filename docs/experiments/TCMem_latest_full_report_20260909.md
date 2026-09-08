@@ -8,13 +8,14 @@
 
 本版本在不重新调用 LLM 构建任务链、不修改已经生成的任务链状态的前提下，对已保存的 Full 候选和通用候选进行了离线 session-level 融合。
 
-全量 `124/124` 个 query 均完成处理，最新 Full 结果为：
+全量 `124/124` 个 query 均完成处理，按在线 evaluator 的二值 Recall-all 定义，最新 Full 结果为：
 
-- Recall-all@10：`0.8022`
+- Recall-all@10：`0.6855`
+- Recall coverage@10：`0.8022`
 - Recall-any@10：`0.9113`
 - nDCG@10：`0.5766`
 
-该版本已经达到预设的 Full Recall-all@10 约 `0.8` 目标，可作为当前版本的完整结果写入实验报告。它是冻结在线实验素材上的 post-hoc retrieval repair，不是重新运行得到的独立在线实验臂。
+这里的 `Recall-all` 要求 top-k 包含该 query 的全部 gold session；原先的 `0.8022` 是 gold session 覆盖率（coverage），现单独列出，避免将 fractional 指标误报为严格 Recall-all。该版本是冻结在线实验素材上的 post-hoc retrieval repair，不是重新运行得到的独立在线实验臂。
 
 ## 2. 数据与固定输入
 
@@ -81,7 +82,8 @@ Full 使用本报告第 3 节的 task-chain-priority fallback。对应的 no-tas
 | 指标 | @5 | @10 | @20 | @30 |
 |---|---:|---:|---:|---:|
 | Recall-any | 0.7823 | **0.9113** | 0.9355 | 0.9758 |
-| Recall-all | 0.6417 | **0.8022** | 0.8790 | 0.9327 |
+| Recall-all（二值） | 0.5242 | **0.6855** | 0.7984 | 0.8790 |
+| Recall coverage | 0.6417 | **0.8022** | 0.8790 | 0.9327 |
 | nDCG | 0.5144 | **0.5766** | 0.6018 | 0.6162 |
 
 ### no-task-chain session-level evidence-sum
@@ -89,7 +91,8 @@ Full 使用本报告第 3 节的 task-chain-priority fallback。对应的 no-tas
 | 指标 | @5 | @10 | @20 | @30 |
 |---|---:|---:|---:|---:|
 | Recall-any | 0.7661 | 0.8387 | 0.9194 | 0.9516 |
-| Recall-all | 0.5970 | 0.6809 | 0.7977 | 0.8569 |
+| Recall-all（二值） | 0.4677 | 0.5403 | 0.6613 | 0.7500 |
+| Recall coverage | 0.5970 | 0.6809 | 0.7977 | 0.8569 |
 | nDCG | 0.5047 | 0.5389 | 0.5748 | 0.5905 |
 
 运行状态：
@@ -137,7 +140,7 @@ query 同时涉及 WhatsApp 项目、Remittance Agent Network 和多个任务状
 
 1. 这是 retrieval-only 结果。当前配置为 `with_qa=false`，没有 QA judge、回答正确性或 helpfulness 分数。
 2. 这是对已经完成的在线实验素材做的冻结离线优化，不是第三个独立在线实验臂。
-3. fallback 使用了已经保存的通用候选缓存，因此 `0.8022` 应作为当前 Full 冻结检索优化结果报告，不应解释为重新运行得到的独立在线结果。
+3. fallback 使用了已经保存的通用候选缓存，因此 Full 的二值 `Recall-all@10=0.6855` 和 coverage `0.8022` 都应作为冻结检索结果报告，不应解释为重新运行得到的独立在线结果。
 4. 当前结果没有重新构建任务链，满足本轮实验约束，但不能替代在同一代码版本下重新接入在线 evaluator 的正式新 arm。
 5. Full 和通用候选由不同 API/model 生成，当前报告不把该配置差异解释为算法效果，而只报告本版本冻结检索结果。
 
@@ -159,7 +162,8 @@ cd /data/wz/agent_memory/iconip2026/TCMem
 - `query_count=124`
 - `task_chain_rebuilt=false`
 - `llm_used_for_retrieval=false`
-- `summary.recall_all@10=0.8022`
+- `summary.recall_all@10=0.6855`
+- `summary.recall_coverage@10=0.8022`
 - `summary.ndcg@10=0.5766`
 
 ## 9. 最新结果文件
@@ -173,4 +177,4 @@ cd /data/wz/agent_memory/iconip2026/TCMem
 
 ## 10. 可直接引用的结果段
 
-在 Adeleke_Okonjo RealMemBench 的 124 个 query 上，冻结任务链状态后采用 Full task-chain-priority fallback 进行 session-level 检索优化。该方法不重新调用 LLM 构建任务链，不修改 memory state，并以 Full task-chain score 作为主排序信号，仅使用已保存的通用候选作低权重召回兜底。最终 Recall-all@10 为 `0.8022`，Recall-any@10 为 `0.9113`，nDCG@10 为 `0.5766`；在 @20 和 @30 下 Recall-all 分别为 `0.8790` 和 `0.9327`。该结果覆盖全部 124 个 query，属于冻结在线素材上的 post-hoc retrieval repair，可作为当前 Full 版本的完整检索结果报告。
+在 Adeleke_Okonjo RealMemBench 的 124 个 query 上，冻结任务链状态后采用 Full task-chain-priority fallback 进行 session-level 检索优化。该方法不重新调用 LLM 构建任务链，不修改 memory state，并以 Full task-chain score 作为主排序信号，仅使用已保存的通用候选作低权重召回兜底。严格二值 Recall-all@10 为 `0.6855`，gold-session coverage@10 为 `0.8022`，Recall-any@10 为 `0.9113`，nDCG@10 为 `0.5766`；在 @20 和 @30 下二值 Recall-all 分别为 `0.7984` 和 `0.8790`。该结果覆盖全部 124 个 query，属于冻结在线素材上的 post-hoc retrieval repair，可作为当前 Full 版本的完整检索结果报告。

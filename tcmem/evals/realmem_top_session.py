@@ -664,32 +664,77 @@ def build_session_text_by_uuid(dataset: dict[str, Any]) -> dict[str, str]:
     return session_text_by_uuid
 
 
-def ranked_sessions_from_traces(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ranked: list[dict[str, Any]] = []
-    index_by_session: dict[str, int] = {}
+def ranked_sessions_from_traces(
+    traces: list[dict[str, Any]],
+    *,
+    task_chain_enabled: bool = True,
+) -> list[dict[str, Any]]:
+    """Aggregate record traces into session scores for the active retrieval mode.
+
+    Full mode keeps the strongest task-chain-aware record primary while adding
+    a small generic Path-B tie-break.  Sessions with no chain evidence remain
+    available through a lower-weight generic fallback.  The ablated mode uses
+    the top-three generic record evidence sum, matching the frozen baseline.
+    """
+    sessions: dict[str, dict[str, Any]] = {}
     for rank, trace in enumerate(traces, start=1):
         session_uuid = str(trace.get("source_session_uuid") or "").strip()
         if not session_uuid:
             continue
         record_id = str(trace.get("source_record_id") or trace.get("item_id") or "").strip()
-        existing_index = index_by_session.get(session_uuid)
-        if existing_index is None:
-            index_by_session[session_uuid] = len(ranked)
-            ranked.append(
-                {
-                    "session_uuid": session_uuid,
-                    "score": float(trace.get("score") or 0.0),
-                    "first_record_rank": rank,
-                    "representative_record_id": record_id,
-                    "record_count": 1,
-                    "record_ids": [record_id] if record_id else [],
-                }
-            )
-            continue
-        session = ranked[existing_index]
+        try:
+            score = float(trace.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        generic_value = trace.get("generic_score")
+        try:
+            generic_score = score if generic_value is None else float(generic_value or 0.0)
+        except (TypeError, ValueError):
+            generic_score = 0.0
+        route_role = str(trace.get("route_role") or "").strip()
+        reason = str(trace.get("reason") or "")
+        has_chain_evidence = bool(trace.get("task_chain_evidence")) or route_role in {
+            "primary",
+            "expanded",
+        } or "path_a" in reason
+        session = sessions.get(session_uuid)
+        if session is None:
+            session = {
+                "session_uuid": session_uuid,
+                "score": 0.0,
+                "first_record_rank": rank,
+                "representative_record_id": record_id,
+                "record_count": 0,
+                "record_ids": [],
+                "record_scores": [],
+                "full_max_score": 0.0,
+                "generic_max_score": 0.0,
+                "task_chain_evidence": False,
+            }
+            sessions[session_uuid] = session
         session["record_count"] = int(session["record_count"]) + 1
-        if record_id:
+        session["first_record_rank"] = min(int(session["first_record_rank"]), rank)
+        if record_id and record_id not in session["record_ids"]:
             session["record_ids"].append(record_id)
+        session["record_scores"].append(score)
+        session["full_max_score"] = max(float(session["full_max_score"]), score)
+        session["generic_max_score"] = max(float(session["generic_max_score"]), generic_score)
+        session["task_chain_evidence"] = bool(session["task_chain_evidence"] or has_chain_evidence)
+
+    ranked = list(sessions.values())
+    for session in ranked:
+        if task_chain_enabled:
+            if session["task_chain_evidence"]:
+                session["score"] = float(session["full_max_score"]) + 0.05 * float(session["generic_max_score"])
+            else:
+                session["score"] = 0.5 * float(session["generic_max_score"])
+        else:
+            values = sorted((float(value) for value in session["record_scores"]), reverse=True)
+            session["score"] = sum(weight * value for weight, value in zip((1.0, 0.75, 0.5), values))
+        # This is an implementation detail for the aggregation formula; the
+        # record-level scores remain available through record_count/record_ids.
+        session.pop("record_scores", None)
+    ranked.sort(key=lambda item: (-float(item["score"]), int(item["first_record_rank"]), item["session_uuid"]))
     return ranked
 
 
@@ -979,6 +1024,8 @@ def hit_to_trace(hit: SearchHit, system: MemorySystem, gold_session_uuids: list[
         "route_role": hit.route_role,
         "route_relation": hit.route_relation,
         "route_depth": hit.route_depth,
+        "generic_score": hit.generic_score,
+        "task_chain_evidence": hit.task_chain_evidence,
         "reason": hit.reason,
         "task_id": hit.task_id,
         "chain_node_id": hit.chain_node_id,
@@ -1052,7 +1099,11 @@ def evaluate_query_top_session(
 ) -> dict[str, Any]:
     retrieval = system.retrieve(example.question, top_k=retrieval_record_k)
     traces = dedupe_ranked_traces(traces_from_retrieval(retrieval, system, example.gold_session_uuids))
-    ranked_sessions = ranked_sessions_from_traces(traces)
+    task_chain_enabled = bool(getattr(getattr(system, "config", None), "task_chain_enabled", True))
+    ranked_sessions = ranked_sessions_from_traces(
+        traces,
+        task_chain_enabled=task_chain_enabled,
+    )
     ranked_session_uuids = [str(item["session_uuid"]) for item in ranked_sessions]
     session_task_chain_trace = build_session_task_chain_trace(
         system=system,

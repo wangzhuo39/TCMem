@@ -230,6 +230,10 @@ class SearchHit:
     route_role: str = "unrouted"
     route_relation: str | None = None
     route_depth: int = 0
+    # Path-B score before any task-chain context penalty.  Full-mode fallback
+    # uses this generic evidence when a record has no usable chain signal.
+    generic_score: float = 0.0
+    task_chain_evidence: bool = False
 
 
 @dataclass(slots=True)

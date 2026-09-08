@@ -321,7 +321,10 @@ def build_task_chain_ablation(
             path_b_bm25_weight=path_b_bm25_weight,
             path_b_graph_weight=path_b_graph_weight,
         )
-        ablated_ranked_sessions = ranked_sessions_from_traces(ablated_items)
+        ablated_ranked_sessions = ranked_sessions_from_traces(
+            ablated_items,
+            task_chain_enabled=False,
+        )
         ablated_ranked_session_uuids = [str(item["session_uuid"]) for item in ablated_ranked_sessions]
         ablated_metrics = compute_retrieval_metrics(
             retrieved_session_uuids=ablated_ranked_session_uuids,

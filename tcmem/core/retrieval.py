@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..config import TCMemConfig
 from ..infrastructure.indices import InMemoryBM25Index, VectorIndex, VectorIndexItem
@@ -20,6 +21,8 @@ class _RecordAggregate:
     route_score: float = 0.0
     path_a_score: float = 0.0
     path_b_score: float = 0.0
+    generic_score: float = 0.0
+    task_chain_evidence: bool = False
     best_overall_score: float = 0.0
     depth: int | None = None
     task_id: str | None = None
@@ -93,7 +96,7 @@ class RetrievalEngine:
 
         ranked = sorted(
             (self._finalize_record_hit(candidate) for candidate in aggregates.values()),
-            key=lambda item: item.score,
+            key=self._record_rank_key,
             reverse=True,
         )[:top_k]
         return RetrievalResult(
@@ -222,6 +225,7 @@ class RetrievalEngine:
                     item_id=record_id,
                     item_kind="dialogue_record",
                     score=base_score * penalty,
+                    generic_score=base_score,
                     semantic_score=semantic_score,
                     bm25_score=bm25_score,
                     graph_score=graph_score,
@@ -249,6 +253,15 @@ class RetrievalEngine:
         aggregate.bm25_score = max(aggregate.bm25_score, hit.bm25_score)
         aggregate.chain_score = max(aggregate.chain_score, hit.chain_score)
         aggregate.graph_score = max(aggregate.graph_score, hit.graph_score)
+        aggregate.generic_score = max(aggregate.generic_score, hit.generic_score)
+        # Path A and routed/expanded Path B hits carry task-chain evidence.
+        # Unrouted Path B hits remain eligible as generic fallback evidence.
+        if (
+            hit.task_chain_evidence
+            or hit.reason == "path_a_chain"
+            or hit.route_role in {"primary", "expanded"}
+        ):
+            aggregate.task_chain_evidence = True
         # Keep route metadata from the strongest route evidence.  The previous
         # implementation updated route_score before comparing, making the
         # comparison always true and allowing a later weaker Path-B hit to
@@ -275,7 +288,10 @@ class RetrievalEngine:
 
     def _finalize_record_hit(self, aggregate: _RecordAggregate) -> SearchHit:
         if self.config.task_chain_enabled:
-            score = self.config.path_a_weight * aggregate.path_a_score + self.config.path_b_weight * aggregate.path_b_score
+            score = (
+                self.config.path_a_weight * aggregate.path_a_score
+                + self.config.path_b_weight * aggregate.path_b_score
+            )
         else:
             score = aggregate.path_b_score
         ordered_reasons = [
@@ -301,7 +317,17 @@ class RetrievalEngine:
             route_role=aggregate.route_role,
             route_relation=aggregate.route_relation,
             route_depth=aggregate.route_depth,
+            generic_score=aggregate.generic_score,
+            task_chain_evidence=aggregate.task_chain_evidence,
         )
+
+    def _record_rank_key(self, hit: SearchHit) -> float:
+        """Return the online ordering score while preserving raw evidence in hit.score."""
+        if not self.config.task_chain_enabled:
+            return hit.score
+        if hit.task_chain_evidence:
+            return hit.score + 0.05 * hit.generic_score
+        return 0.5 * hit.generic_score
 
     def _merge_path_b_seeds(self, vector_seeds: list, bm25_seeds: list) -> list[SearchHit]:
         merged: dict[str, dict[str, float]] = {}
